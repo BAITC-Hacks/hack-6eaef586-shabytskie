@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 import secrets
 import altair as alt
@@ -6,7 +7,7 @@ import pandas as pd
 import streamlit as st
 from src.ordering import EXPORT_COLUMNS, STATUS_MISSING_STOCK, URGENCY_ORDER
 from src.security import public_error, security_event
-from src.web_auth import require_principal, PERMISSIONS
+from src.web_auth import Principal, require_principal, PERMISSIONS
 from src.web_service import WebService
 
 DEMO = Path('data/demo')
@@ -27,7 +28,16 @@ INPUTS = {
 st.set_page_config(page_title='Заказы поставщикам',
                    page_icon=str(Path(__file__).resolve().parent / 'site-icon.jpg'), layout='wide')
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
-principal = require_principal()
+local_mode = os.environ.get('APP_MODE') == 'local'
+if local_mode:
+    # Explicit local access requires a loopback listener.
+    if st.get_option('server.address') not in {'127.0.0.1', '::1'}:
+        st.error('Локальный режим доступен только при запуске с --server.address 127.0.0.1.')
+        st.stop()
+    principal = Principal('local-operator', 'manager', float('inf'))
+    st.caption('Локальный режим · можно загружать свои CSV и Excel-файлы.')
+else:
+    principal = require_principal()
 
 
 @st.cache_resource(show_spinner=False)
@@ -62,7 +72,7 @@ def calculate(demo: bool, uploads=None, review=7, z=1.65, warehouse=None, catego
 
 
 with st.sidebar:
-    if principal.role != 'demo' and st.button('Выйти', key='logout'):
+    if not local_mode and principal.role != 'demo' and st.button('Выйти', key='logout'):
         if st.session_state.get('result_token'):
             try:
                 service.discard(st.session_state.result_token, principal, session_key)
@@ -204,7 +214,10 @@ with tab_orders:
         column_config={'Обоснование': st.column_config.TextColumn(width='large')},
         hide_index=True, width='stretch', key=f'editor_{result_token}_{supplier}')
     can_approve = bool({'approve', 'approve_demo'} & PERMISSIONS[principal.role])
-    st.caption('Ответственный определяется учётной записью; в демо утверждение учебное.')
+    if local_mode:
+        st.caption('Ответственный: локальный пользователь этого компьютера.')
+    else:
+        st.caption('Ответственный определяется учётной записью; в демо утверждение учебное.')
     if st.button('Утвердить заказ выбранному поставщику', disabled=not can_approve, key='approve'):
         try:
             edits = edited[['Артикул', 'Утверждённое количество']].rename(

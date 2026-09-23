@@ -9,7 +9,7 @@ enableStaticServing = false
 
 [client]
 showErrorDetails = "none"
-toolbarMode = "minimal"
+toolbarMode = "viewer"
 
 [browser]
 gatherUsageStats = false
