@@ -5,7 +5,7 @@ import pandas as pd
 DAYS = 400
 
 
-def generate(path: str | Path = 'data/raw/synthetic_sales.csv', seed: int = 42) -> pd.DataFrame:
+def generate(path: str | Path = 'data/demo/synthetic_sales.csv', seed: int = 42) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     rows = []
     for i in range(20):

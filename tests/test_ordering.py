@@ -5,7 +5,8 @@ import numpy as np
 import pandas as pd
 from src.config import Config
 from src.forecasting import predict_future, train_model
-from src.ordering import annual_factor, parse_fraction, recommend_orders, supplier_summary
+from src.ordering import (annual_factor, current_inventory, parse_fraction, recommend_orders,
+                          supplier_summary, validate_approved_orders)
 from src.pipeline import prepare, run_pipeline
 
 CONFIG = Config()
@@ -43,6 +44,19 @@ class MustHave1AllSourcesAffectResult(unittest.TestCase):
         stock = pd.DataFrame({'sku': ['A1', 'A1'], 'warehouse': ['W1', 'W2'], 'stock': ['20', '30']})
         self.assertEqual(order(sales(), stock=stock).recommended_qty, 160)
 
+    def test_duplicate_warehouse_snapshot_is_not_double_counted(self):
+        stock = pd.DataFrame({'sku': ['A1', 'A1'], 'warehouse': ['W1', 'W1'],
+                              'stock': ['20', '20']})
+        _, daily = prepare(sales())
+        inventory = current_inventory(daily, stock).iloc[0]
+        self.assertEqual(inventory.stock, 20)
+
+    def test_latest_dated_warehouse_snapshot_wins(self):
+        stock = pd.DataFrame({'sku': ['A1', 'A1'], 'warehouse': ['W1', 'W1'],
+                              'date': ['2025-01-02', '2025-01-01'], 'stock': ['20', '90']})
+        _, daily = prepare(sales())
+        self.assertEqual(current_inventory(daily, stock).iloc[0].stock, 20)
+
     def test_sales_history(self):
         self.assertEqual(order(sales(qty=20.)).recommended_qty, 320)
 
@@ -70,6 +84,18 @@ class MustHave1AllSourcesAffectResult(unittest.TestCase):
     def test_parse_fraction(self):
         self.assertEqual([parse_fraction(v) for v in ['10%', '0,1', '0.1', '10']], [.1, .1, .1, .1])
 
+    def test_invalid_growth_is_rejected(self):
+        growth = pd.DataFrame({'sku': ['A1'], 'growth_forecast': ['-150%']})
+        with self.assertRaisesRegex(ValueError, 'growth_forecast'):
+            order(sales(), growth=growth)
+
+    def test_missing_stock_blocks_recommendation(self):
+        result = order(sales().drop(columns='stock'))
+        self.assertTrue(pd.isna(result.recommended_qty))
+        self.assertEqual(result.urgency, 'требуются данные')
+        self.assertIn('заблокирован', result.status)
+        self.assertIn('остаток неизвестен', result.reason)
+
 
 class MustHave2SeasonalityAndGrowth(unittest.TestCase):
 
@@ -87,6 +113,16 @@ class MustHave2SeasonalityAndGrowth(unittest.TestCase):
     def test_no_annual_factor_without_a_year_of_history(self):
         _, daily = prepare(sales())
         self.assertIsNone(annual_factor(daily, daily.date.max() + pd.Timedelta(days=1), 21))
+
+    def test_random_forest_does_not_apply_second_annual_factor(self):
+        dates = pd.date_range('2024-01-01', '2025-05-25')
+        frame = sales(len(dates), start='2024-01-01', stock=0.)
+        frame['quantity'] = np.where(dates.month.isin([6, 7, 8]), 30., 10.)
+        _, daily = prepare(frame)
+        future = predict_future(daily, 60, None, CONFIG)
+        future['model_used'] = 'random_forest'
+        result = recommend_orders(daily, future, CONFIG).iloc[0]
+        self.assertIsNone(result.seasonal_factor)
 
     def test_weekly_pattern_in_model_forecast(self):
         dates = pd.date_range('2025-01-06', periods=140)
@@ -176,6 +212,20 @@ class MustHave4OneOffOrders(unittest.TestCase):
 
 
 class MustHave5SupplierListWithReasons(unittest.TestCase):
+
+    def test_manual_approval_validates_minimum_and_multiple(self):
+        base = pd.DataFrame({'sku': ['A1'], 'approved_qty': [25.],
+                             'min_order_qty': [20.], 'order_multiple': [5.]})
+        self.assertEqual(validate_approved_orders(base).approved_qty.iloc[0], 25.)
+        with self.assertRaisesRegex(ValueError, 'кратно'):
+            validate_approved_orders(base.assign(approved_qty=23.))
+        with self.assertRaisesRegex(ValueError, 'минимальной партии'):
+            validate_approved_orders(base.assign(approved_qty=10.))
+        with self.assertRaisesRegex(ValueError, 'неотрицательным'):
+            validate_approved_orders(base.assign(approved_qty=-5.))
+        blocked = base.assign(status='заблокирован — нет актуального остатка')
+        with self.assertRaisesRegex(ValueError, 'без актуального остатка'):
+            validate_approved_orders(blocked)
 
     def test_pipeline_outputs_grouped_orders_with_reason(self):
         parts = []

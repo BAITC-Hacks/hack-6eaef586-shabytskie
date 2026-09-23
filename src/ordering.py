@@ -12,8 +12,9 @@ import numpy as np
 import pandas as pd
 from src.config import Config
 
-URGENCY_ORDER = {'критично': 0, 'высокая': 1, 'плановая': 2, 'не требуется': 3}
+URGENCY_ORDER = {'требуются данные': -1, 'критично': 0, 'высокая': 1, 'плановая': 2, 'не требуется': 3}
 STATUS_DRAFT = 'черновик — требует утверждения'
+STATUS_MISSING_STOCK = 'заблокирован — нет актуального остатка'
 
 
 def parse_fraction(value) -> float | None:
@@ -82,6 +83,13 @@ def current_inventory(daily: pd.DataFrame, stock: pd.DataFrame | None = None) ->
     result = pd.DataFrame(rows)
     if stock is not None and not stock.empty:
         table = stock.copy()
+        # Справочник остатков — это снимки, а не движения. Для каждого склада
+        # оставляем только последнюю строку, чтобы дубли не удваивали запас.
+        if 'date' in table:
+            table['date'] = pd.to_datetime(table['date'], errors='coerce', format='mixed')
+            table = table.sort_values('date', na_position='first')
+        snapshot_keys = ['sku'] + (['warehouse'] if 'warehouse' in table else [])
+        table = table.drop_duplicates(snapshot_keys, keep='last')
         for col in ['stock', 'in_transit']:
             if col in table:
                 table[col] = table[col].map(_number)
@@ -139,6 +147,11 @@ def planned_growth(growth: pd.DataFrame | None, sku: str, category: str) -> floa
             if len(match):
                 parsed = parse_fraction(match.growth_forecast.iloc[-1])
                 if parsed is not None:
+                    if not math.isfinite(parsed) or parsed <= -1 or parsed > 3:
+                        raise ValueError(
+                            f'Invalid growth_forecast for {key}={value!r}: {parsed:.1%}. '
+                            'Expected a value greater than -100% and no more than 300%.'
+                        )
                     return parsed
     return 0.
 
@@ -165,7 +178,10 @@ def recommend_orders(daily: pd.DataFrame, future: pd.DataFrame, config: Config,
         lead = int(p.lead_time_days)
         coverage = lead + config.review_period_days
         model_demand = forecast_window(future, sku, start, coverage)
-        seasonal = annual_factor(group, start, coverage)
+        forecast_method = future.loc[future.sku == sku, 'model_used'].iloc[0]
+        # RandomForest already receives month and annual sin/cos features. The
+        # explicit annual factor is only a fallback for moving-average methods.
+        seasonal = None if forecast_method == 'random_forest' else annual_factor(group, start, coverage)
         trend, monthly = trend_factor(group, coverage)
         plan = planned_growth(growth, sku, p.category)
         demand = model_demand * (seasonal or 1.) * trend * (1 + plan)
@@ -182,17 +198,21 @@ def recommend_orders(daily: pd.DataFrame, future: pd.DataFrame, config: Config,
             error = float(group.adjusted_demand.tail(90).std(ddof=0)) if len(group) > 1 else 0.
         safety = config.service_level_z * error * math.sqrt(coverage)
 
-        on_hand = inv.stock if pd.notna(inv.stock) else 0.
+        stock_known = pd.notna(inv.stock)
+        on_hand = float(inv.stock) if stock_known else 0.
         in_transit = inv.in_transit if pd.notna(inv.in_transit) else 0.
         available = on_hand + in_transit
         need = demand + safety - available
         quantity = 0.
-        if need > 0:
+        if stock_known and need > 0:
             quantity = math.ceil(need / p.order_multiple - 1e-9) * p.order_multiple
             quantity = max(quantity, p.min_order_qty)
         days_of_cover = available / daily_rate if daily_rate > 0 else float('inf')
         # Критично: запас закончится раньше, чем придёт поставка.
-        if quantity <= 0:
+        if not stock_known:
+            quantity, need, days_of_cover = float('nan'), float('nan'), None
+            urgency = 'требуются данные'
+        elif quantity <= 0:
             urgency = 'не требуется'
         elif days_of_cover < lead:
             urgency = 'критично'
@@ -210,7 +230,8 @@ def recommend_orders(daily: pd.DataFrame, future: pd.DataFrame, config: Config,
 
         row = dict(supplier=p.supplier, sku=sku, product_name=p.product_name, category=p.category,
                    recommended_qty=float(quantity), approved_qty=float(quantity), urgency=urgency,
-                   days_of_cover=round(days_of_cover, 1) if np.isfinite(days_of_cover) else None,
+                   days_of_cover=(round(days_of_cover, 1)
+                                  if days_of_cover is not None and np.isfinite(days_of_cover) else None),
                    lead_time_days=lead, coverage_days=coverage, model_demand=round(model_demand, 1),
                    seasonal_factor=round(seasonal, 3) if seasonal else None, trend_factor=round(trend, 3),
                    planned_growth=plan, demand_for_coverage=round(demand, 1), safety_stock=round(safety, 1),
@@ -218,8 +239,8 @@ def recommend_orders(daily: pd.DataFrame, future: pd.DataFrame, config: Config,
                    raw_sales_need=round(raw_need, 1), lost_demand_adjustment=round(lost, 1),
                    one_off_orders_removed=round(removed, 1), min_order_qty=p.min_order_qty,
                    order_multiple=p.order_multiple, price=p.price,
-                   order_value=round(quantity * p.price, 2) if p.price is not None else None,
-                   status=STATUS_DRAFT)
+                   order_value=round(quantity * p.price, 2) if p.price is not None and np.isfinite(quantity) else None,
+                   status=STATUS_DRAFT if stock_known else STATUS_MISSING_STOCK)
         row['reason'] = explain(row, monthly, error_source)
         rows.append(row)
     result = pd.DataFrame(rows)
@@ -239,6 +260,9 @@ def explain(row: dict, monthly: float | None, error_source: str) -> str:
         parts.append(f"плановый прирост {row['planned_growth']:+.0%}")
     text = ', '.join(parts) + f" → спрос {row['demand_for_coverage']:.0f} ед. "
     text += f"Страховой запас {row['safety_stock']:.0f} ед. ({error_source}). "
+    if row['status'] == STATUS_MISSING_STOCK:
+        return (text + 'Актуальный остаток неизвестен: рекомендация заблокирована. '
+                'Загрузите остатки через --stock или добавьте датированный остаток в историю продаж.').strip()
     text += (f"Доступно {row['stock'] + row['in_transit']:.0f} ед. (остаток {row['stock']:.0f}"
              f" + в пути {row['in_transit']:.0f}). ")
     if row['recommended_qty'] > 0:
@@ -268,6 +292,30 @@ def supplier_summary(orders: pd.DataFrame) -> pd.DataFrame:
         'critical_positions': grouped.urgency.apply(lambda s: int((s == 'критично').sum())),
     }).reset_index()
     return result.sort_values(['critical_positions', 'total_value'], ascending=False).reset_index(drop=True)
+
+
+def validate_approved_orders(orders: pd.DataFrame) -> pd.DataFrame:
+    """Validate manual quantities before creating approval artifacts."""
+    result = orders.copy()
+    quantities = pd.to_numeric(result['approved_qty'], errors='coerce')
+    invalid = quantities.isna() | ~np.isfinite(quantities) | quantities.lt(0)
+    if invalid.any():
+        skus = ', '.join(result.loc[invalid, 'sku'].astype(str).tolist())
+        raise ValueError(f'Утверждённое количество должно быть неотрицательным числом: {skus}')
+    for idx, quantity in quantities.items():
+        if quantity == 0:
+            continue
+        if 'status' in result and result.at[idx, 'status'] == STATUS_MISSING_STOCK:
+            raise ValueError(f"{result.at[idx, 'sku']}: нельзя утвердить заказ без актуального остатка")
+        minimum = _number(result.at[idx, 'min_order_qty'], 0.)
+        multiple = _number(result.at[idx, 'order_multiple'], 1.) or 1.
+        if quantity < minimum:
+            raise ValueError(f"{result.at[idx, 'sku']}: количество {quantity:g} меньше минимальной партии {minimum:g}")
+        ratio = quantity / multiple
+        if not math.isclose(ratio, round(ratio), abs_tol=1e-9):
+            raise ValueError(f"{result.at[idx, 'sku']}: количество {quantity:g} должно быть кратно {multiple:g}")
+    result['approved_qty'] = quantities.astype(float)
+    return result
 
 
 EXPORT_COLUMNS = {
