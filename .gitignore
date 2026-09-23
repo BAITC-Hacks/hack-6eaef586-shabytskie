@@ -2,5 +2,8 @@
 __pycache__/
 *.pyc
 .DS_Store
-models/*.joblib
-outputs/approved/
+.streamlit/secrets.toml
+.pytest_cache/
+outputs/
+data/processed/
+models/

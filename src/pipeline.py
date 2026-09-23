@@ -102,7 +102,9 @@ def run_pipeline(input_path: str | Path, config: Config, chart_sku: str | None =
         if 'warehouse' not in frame:
             raise ValueError('--warehouse requires a warehouse column in sales data')
         frame = frame[frame.warehouse.astype(str).str.strip() == warehouse]
-        if stock is not None and 'warehouse' in stock:
+        if stock is not None:
+            if 'warehouse' not in stock:
+                raise ValueError('--warehouse: в таблице остатков нет колонки «Склад», остатки по складу не выделить')
             stock = stock[stock.warehouse == warehouse]
         if frame.empty:
             raise ValueError(f'No rows for warehouse {warehouse!r}')

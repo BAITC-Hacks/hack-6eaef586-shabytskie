@@ -1,12 +1,13 @@
 import pandas as pd
+from src.preprocessing import parse_dates
 
 
 def apply_stockout_periods(daily: pd.DataFrame, periods: pd.DataFrame | None) -> pd.DataFrame:
     if periods is None or periods.empty:
         return daily
     result = daily.copy()
-    starts = pd.to_datetime(periods.date_from, errors='coerce', format='mixed').dt.normalize()
-    ends = pd.to_datetime(periods.date_to, errors='coerce', format='mixed').dt.normalize().fillna(result.date.max())
+    starts = parse_dates(periods.date_from)
+    ends = parse_dates(periods.date_to).fillna(result.date.max()) if 'date_to' in periods else pd.Series(result.date.max(), index=periods.index)
     for sku, start, end in zip(periods.sku.astype(str), starts, ends):
         if pd.isna(start):
             continue

@@ -7,10 +7,12 @@
     заказ = потребность, округлённая вверх до кратности, но не меньше минимальной партии
 """
 import math
+import re
 from pathlib import Path
 import numpy as np
 import pandas as pd
 from src.config import Config
+from src.preprocessing import SPACES
 
 URGENCY_ORDER = {'критично': 0, 'высокая': 1, 'плановая': 2, 'не требуется': 3}
 STATUS_DRAFT = 'черновик — требует утверждения'
@@ -19,17 +21,17 @@ STATUS_DRAFT = 'черновик — требует утверждения'
 def parse_fraction(value) -> float | None:
     if value is None or (isinstance(value, float) and math.isnan(value)) or pd.isna(value):
         return None
-    text = str(value).strip().replace(' ', '').replace(',', '.')
+    text = re.sub(SPACES, '', str(value)).replace(',', '.')
     if not text:
         return None
     percent = text.endswith('%')
     number = float(text.rstrip('%'))
-    return number / 100 if percent or abs(number) > 1 else number
+    return number / 100 if percent or abs(number) >= 1 else number
 
 
 def _number(value, default=None):
     try:
-        number = float(str(value).replace(' ', '').replace(',', '.'))
+        number = float(re.sub(SPACES, '', str(value)).replace(',', '.'))
     except (TypeError, ValueError):
         return default
     return default if math.isnan(number) or number < 0 else number
@@ -71,7 +73,7 @@ def sku_parameters(daily: pd.DataFrame, config: Config, catalog: pd.DataFrame | 
 def current_inventory(daily: pd.DataFrame, stock: pd.DataFrame | None = None) -> pd.DataFrame:
     rows = []
     for sku, group in daily.groupby('sku', sort=False):
-        item = {'sku': sku, 'stock': None, 'stock_as_of': None, 'in_transit': 0.}
+        item = {'sku': sku, 'stock': None, 'stock_as_of': 'нет данных', 'in_transit': 0.}
         if 'stock' in group and group.stock.notna().any():
             known = group[group.stock.notna()].iloc[-1]
             item['stock'], item['stock_as_of'] = float(known.stock), known.date.date().isoformat()
@@ -182,7 +184,8 @@ def recommend_orders(daily: pd.DataFrame, future: pd.DataFrame, config: Config,
             error = float(group.adjusted_demand.tail(90).std(ddof=0)) if len(group) > 1 else 0.
         safety = config.service_level_z * error * math.sqrt(coverage)
 
-        on_hand = inv.stock if pd.notna(inv.stock) else 0.
+        stock_known = pd.notna(inv.stock)
+        on_hand = inv.stock if stock_known else 0.
         in_transit = inv.in_transit if pd.notna(inv.in_transit) else 0.
         available = on_hand + in_transit
         need = demand + safety - available
@@ -211,15 +214,15 @@ def recommend_orders(daily: pd.DataFrame, future: pd.DataFrame, config: Config,
         row = dict(supplier=p.supplier, sku=sku, product_name=p.product_name, category=p.category,
                    recommended_qty=float(quantity), approved_qty=float(quantity), urgency=urgency,
                    days_of_cover=round(days_of_cover, 1) if np.isfinite(days_of_cover) else None,
-                   lead_time_days=lead, coverage_days=coverage, model_demand=round(model_demand, 1),
-                   seasonal_factor=round(seasonal, 3) if seasonal else None, trend_factor=round(trend, 3),
+                   lead_time_days=lead, coverage_days=coverage, model_demand=round(model_demand, 2),
+                   seasonal_factor=round(seasonal, 4) if seasonal else None, trend_factor=round(trend, 4),
                    planned_growth=plan, demand_for_coverage=round(demand, 1), safety_stock=round(safety, 1),
                    stock=on_hand, stock_as_of=inv.stock_as_of, in_transit=in_transit, net_need=round(need, 1),
                    raw_sales_need=round(raw_need, 1), lost_demand_adjustment=round(lost, 1),
                    one_off_orders_removed=round(removed, 1), min_order_qty=p.min_order_qty,
                    order_multiple=p.order_multiple, price=p.price,
                    order_value=round(quantity * p.price, 2) if p.price is not None else None,
-                   status=STATUS_DRAFT)
+                   stock_known=stock_known, status=STATUS_DRAFT)
         row['reason'] = explain(row, monthly, error_source)
         rows.append(row)
     result = pd.DataFrame(rows)
@@ -239,7 +242,8 @@ def explain(row: dict, monthly: float | None, error_source: str) -> str:
         parts.append(f"плановый прирост {row['planned_growth']:+.0%}")
     text = ', '.join(parts) + f" → спрос {row['demand_for_coverage']:.0f} ед. "
     text += f"Страховой запас {row['safety_stock']:.0f} ед. ({error_source}). "
-    text += (f"Доступно {row['stock'] + row['in_transit']:.0f} ед. (остаток {row['stock']:.0f}"
+    stock_text = f"{row['stock']:.0f}" if row['stock_known'] else 'нет данных, принят 0'
+    text += (f"Доступно {row['stock'] + row['in_transit']:.0f} ед. (остаток {stock_text}"
              f" + в пути {row['in_transit']:.0f}). ")
     if row['recommended_qty'] > 0:
         text += f"Потребность {row['net_need']:.0f} → заказ {row['recommended_qty']:.0f} ед."
@@ -280,6 +284,16 @@ EXPORT_COLUMNS = {
 }
 
 
+def to_1c_csv(table: pd.DataFrame) -> bytes:
+    # Для 1С и русского Excel: разделитель «;», десятичная запятая, UTF-8 с BOM, целые без «.0».
+    table = table.copy()
+    for col in table.select_dtypes('number'):
+        values = table[col]
+        if values.dropna().eq(values.dropna().round()).all():
+            table[col] = values.round().astype('Int64')
+    return table.to_csv(sep=';', decimal=',', index=False).encode('utf-8-sig')
+
+
 def export_orders(orders: pd.DataFrame, directory) -> dict:
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -298,8 +312,7 @@ def export_orders(orders: pd.DataFrame, directory) -> dict:
             used.add(name)
             group.to_excel(writer, sheet_name=name, index=False)
     csv = directory / 'supplier_orders_1c.csv'
-    # Формат для импорта в 1С/Excel: разделитель «;», UTF-8 с BOM, только позиции к заказу.
-    readable[readable['Рекомендуемое количество'] > 0].to_csv(csv, sep=';', index=False, encoding='utf-8-sig')
+    csv.write_bytes(to_1c_csv(readable[readable['Рекомендуемое количество'] > 0]))
     full = directory / 'supplier_orders.csv'
     orders.to_csv(full, index=False)
     return {'xlsx': xlsx, 'csv_1c': csv, 'csv': full}
