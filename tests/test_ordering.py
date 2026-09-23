@@ -68,7 +68,26 @@ class MustHave1AllSourcesAffectResult(unittest.TestCase):
         self.assertEqual(result.urgency, 'не требуется')
 
     def test_parse_fraction(self):
-        self.assertEqual([parse_fraction(v) for v in ['10%', '0,1', '0.1', '10']], [.1, .1, .1, .1])
+        self.assertEqual([parse_fraction(v) for v in ['10%', '0,1', '0.1', '10', '1']], [.1, .1, .1, .1, .01])
+
+    def test_warehouse_without_sales_on_last_day_keeps_its_stock(self):
+        first = sales(warehouse='W1')
+        second = sales(warehouse='W2', stock=500.).iloc[:-3]
+        self.assertEqual(order(pd.concat([first, second])).stock, 600)
+
+    def test_one_empty_warehouse_is_not_a_stockout(self):
+        first = sales(warehouse='W1')
+        first.loc[69, 'stock'] = 0.
+        second = sales(warehouse='W2', stock=500.).iloc[:-3]
+        _, daily = prepare(pd.concat([first, second]))
+        self.assertFalse(daily.stockout_flag.iloc[-1])
+        self.assertEqual(daily.estimated_lost_demand.sum(), 0)
+
+    def test_unknown_stock_is_stated_in_reason(self):
+        result = order(sales().drop(columns='stock'))
+        self.assertFalse(result.stock_known)
+        self.assertIn('нет данных', result.reason)
+        self.assertEqual(result.recommended_qty, 210)
 
 
 class MustHave2SeasonalityAndGrowth(unittest.TestCase):
@@ -162,7 +181,8 @@ class MustHave4OneOffOrders(unittest.TestCase):
         self.assertLessEqual(abs(result.recommended_qty - clean.recommended_qty), .05 * clean.recommended_qty)
         transactions, daily = prepare(bulk)
         flagged = transactions[transactions.is_large_client_order]
-        self.assertEqual(list(flagged.client_id), ['C1'])
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged.index[0], transactions[transactions.quantity == 1000.].index[0])
         self.assertEqual(flagged.quantity_clean.iloc[0], 5.)
         self.assertEqual(daily.large_client_orders_detected.sum(), 1)
         self.assertGreater(result.raw_sales_need, 3 * result.recommended_qty)
@@ -204,8 +224,23 @@ class MustHave5SupplierListWithReasons(unittest.TestCase):
             sheets = pd.read_excel(root / 'out' / 'supplier_orders.xlsx', sheet_name=None)
             self.assertTrue({'Сводка', 'Все позиции', 'S1', 'S2'} <= set(sheets))
             self.assertTrue(sheets['S1']['Обоснование'].notna().all())
-            one_c = pd.read_csv(root / 'out' / 'supplier_orders_1c.csv', sep=';', encoding='utf-8-sig')
+            one_c = pd.read_csv(root / 'out' / 'supplier_orders_1c.csv', sep=';', decimal=',', encoding='utf-8-sig')
             self.assertEqual(set(one_c['Артикул']), {'A1', 'B1'})
+            self.assertEqual(one_c['Рекомендуемое количество'].dtype.kind, 'i')
+            raw_text = (root / 'out' / 'supplier_orders_1c.csv').read_text(encoding='utf-8-sig')
+            self.assertNotIn('.0;', raw_text)
+
+            audit = pd.read_csv(root / 'p' / 'transactions_audit.csv')
+            self.assertFalse(audit.client_id.isin(['C1']).any())
+            self.assertTrue(audit.client_id.str.match(r'^C[0-9a-f]{12}$').all())
+
+            with self.assertRaisesRegex(ValueError, 'Склад'):
+                stock_path = root / 'stock.csv'
+                pd.DataFrame({'sku': ['A1'], 'stock': [5]}).to_csv(stock_path, index=False)
+                parts_wh = pd.concat(parts).assign(warehouse='W1')
+                parts_wh.to_csv(path, index=False)
+                run_pipeline(path, config, stock_path=stock_path, warehouse='W1')
+            pd.concat(parts).to_csv(path, index=False)
 
             only = run_pipeline(path, config, category='Щиты')
             self.assertEqual(set(only.sku), {'A0', 'B1'})

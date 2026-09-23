@@ -78,6 +78,22 @@ class DemandTests(unittest.TestCase):
                 self.assertEqual(loaded.sku.iloc[0], '001')
                 self.assertEqual(len(clean_transactions(loaded)), 5)
 
+    def test_1c_date_and_number_formats(self):
+        frame = pd.DataFrame({'Дата': ['01.02.2025', '05.03.2025', '13.02.2025', '2025-02-14 00:00:00'],
+                              'Артикул': ['00123'] * 4,
+                              'Количество': ['1\u00a0234,5', '2 000', '3,0', '4'],
+                              'Нет в наличии': ['Ложь', 'нет', 'Истина', 'Да']})
+        result = clean_transactions(map_columns(frame)).sort_values('date')
+        self.assertEqual([d.strftime('%Y-%m-%d') for d in result.date],
+                         ['2025-02-01', '2025-02-13', '2025-02-14', '2025-03-05'])
+        self.assertEqual(result.quantity.tolist(), [1234.5, 3., 4., 2000.])
+        self.assertEqual(result.stockout_flag.tolist(), [False, True, True, False])
+
+    def test_stockout_periods_in_1c_date_format(self):
+        _, daily = prepare(fixture(40), pd.DataFrame({'sku': ['001'], 'date_from': ['05.02.2025'], 'date_to': ['07.02.2025']}))
+        flagged = daily[daily.stockout_flag].date.dt.strftime('%Y-%m-%d').tolist()
+        self.assertEqual(flagged, ['2025-02-05', '2025-02-06', '2025-02-07'])
+
     def test_warehouse_stock_is_not_double_counted(self):
         frame = fixture(4)
         frame['warehouse'] = 'WH1'
