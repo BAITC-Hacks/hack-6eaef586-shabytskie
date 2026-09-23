@@ -127,15 +127,19 @@ class MustHave2SeasonalityAndGrowth(unittest.TestCase):
         _, daily = prepare(sales())
         self.assertIsNone(annual_factor(daily, daily.date.max() + pd.Timedelta(days=1), 21))
 
-    def test_random_forest_does_not_apply_second_annual_factor(self):
+    def test_seasonality_is_not_applied_twice_to_model_forecast(self):
         dates = pd.date_range('2024-01-01', '2025-05-25')
         frame = sales(len(dates), start='2024-01-01', stock=0.)
         frame['quantity'] = np.where(dates.month.isin([6, 7, 8]), 30., 10.)
         _, daily = prepare(frame)
         future = predict_future(daily, 60, None, CONFIG)
         future['model_used'] = 'random_forest'
+        future['prediction'] = 25.  # модель уже частично заложила сезон
         result = recommend_orders(daily, future, CONFIG).iloc[0]
-        self.assertIsNone(result.seasonal_factor)
+        # С историей больше года база — уровень 28 дн., а не прогноз модели, поэтому
+        # сезонность учитывается один раз и не зависит от того, что заложила модель.
+        self.assertIn('уровень', result.demand_method)
+        self.assertAlmostEqual(result.demand_for_coverage, 10 * result.coverage_days * result.seasonal_factor, delta=1)
 
     def test_weekly_pattern_in_model_forecast(self):
         dates = pd.date_range('2025-01-06', periods=140)
