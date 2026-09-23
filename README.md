@@ -1,190 +1,55 @@
-# Электрокомплект: автоматический расчёт заказов поставщикам
+# StockPilot
 
-Сервис строит по истории продаж рекомендованные заказы поставщикам. Для каждого артикула он выдаёт количество, срочность и обоснование, а весь список группирует по поставщикам. При расчёте учитываются сезонность, устойчивый рост, текущие остатки, товары в пути, категории, плановый прирост и упущенный спрос в периоды отсутствия товара. Разовые крупные заказы, включая крупные продажи одному клиенту, из регулярной потребности исключаются.
+StockPilot is a local Streamlit purchasing dashboard for the Elektrokomplekt inventory-replenishment case. It supports file validation, provider integration, a transparent synthetic/demo provider, manager review and purchase-draft exports. It does not send orders or write to an ERP.
 
-Менеджер отдела закупа запускает расчёт по складу или категории, получает список по поставщикам, при необходимости правит количество и утверждает заказ. **Автоматически поставщику ничего не отправляется**: утверждение только сохраняет файлы для ответственного сотрудника.
+## Run locally
 
-## Запуск
-
-Нужен Python 3.11+.
+Python 3.11 or newer is recommended. From the repository root:
 
 ```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
+python -m venv .venv
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+# macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-
-# быстрый старт: без аргументов считает на демо-данных из data/raw (создаёт их при необходимости)
-python main.py
-
-# синтетические данные + справочники (data/raw/*.csv)
-python -m src.generate_synthetic_data
-
-# полный расчёт
-python main.py --input data/raw/synthetic_sales.csv \
-  --suppliers data/raw/suppliers.csv --catalog data/raw/catalog.csv \
-  --stockouts data/raw/stockouts.csv --growth data/raw/category_growth.csv \
-  --chart-sku SKU001
-
-# только один склад / одна категория
-python main.py --input data/raw/synthetic_sales.csv --warehouse WH1
-python main.py --input data/raw/synthetic_sales.csv --category "Категория 1"
-
-# дашборд: просмотр по поставщикам, корректировка, утверждение, выгрузка
 streamlit run app.py
-
-# тесты
-python -m unittest discover -s tests -v
 ```
 
-Параметры политики запасов: `--review-days` (период пересмотра, по умолчанию 7), `--service-z` (z уровня сервиса, 1.65 ≈ 95%), `--default-lead-time` (срок поставки, если он не указан, 14). `--forecast-days` задаёт горизонт отчёта прогноза. Горизонт прогноза для заказа выбирается автоматически и покрывает самый длинный срок поставки плюс период пересмотра.
+In the sidebar load synthetic data, then calculate recommendations. To run the test suite: `pytest -q`.
 
-## Входные данные
+## Inputs
 
-Все файлы принимаются в CSV (любой разделитель) или XLSX. Названия колонок распознаются на русском и английском, регистр не важен. Если две колонки подходят под одно поле, файл отклоняется.
+Use one `.xlsx` workbook with sheets `sales`, `inventory`, `suppliers`, and optional `stock_history`, or upload the three required CSVs and optional stock-history CSV separately. Identifiers are read as text so leading zeroes are retained.
 
-| Файл | Обязательные поля | Необязательные |
+| Table | Required columns | Optional columns |
 |---|---|---|
-| `--input` история продаж | Дата, Артикул, Количество | ID клиента (обезличенный), Наименование, Цена, Склад, Остаток на дату, Нет в наличии, Поставщик, Категория, Срок поставки, В пути |
-| `--suppliers` справочник поставщиков | Поставщик | Срок поставки, Минимальная партия |
-| `--catalog` номенклатура / выгрузка из 1С | Артикул | Наименование, Категория, Поставщик, Срок поставки, Мин. партия, Кратность |
-| `--stock` текущие остатки | Артикул, Остаток | Склад, В пути (суммируются по складам) |
-| `--stockouts` периоды отсутствия | Артикул, Дата начала | Дата окончания (пусто = по последнюю дату) |
-| `--growth` прогноз прироста | Прирост + Категория или Артикул | `10%`, `0,1` и `0.1` значат одно и то же; строка по артикулу важнее строки по категории |
+| sales | `date`, `sku`, `quantity` | `client_id` (anonymized), `price`, `warehouse`; additional fields are preserved for the forecasting provider |
+| inventory | `sku`, `product_name`, `category`, `supplier`, `current_stock`, `in_transit` | `growth_rate`, `unit`, `unit_cost`, `currency`, `moq`, `order_multiple` |
+| suppliers | `supplier`, `lead_time_days` | — |
+| stock_history | `date`, `sku`, `in_stock` | — |
 
-Приоритет источников для параметров товара: номенклатура → справочник поставщиков → поля из выгрузки продаж → значения по умолчанию. Остатки из `--stock` имеют приоритет над остатками из продаж. Если на последнюю дату зафиксировано отсутствие товара, старый положительный остаток не используется.
+MVP assumes one active supplier per SKU and unique inventory/supplier keys. Sales rows are treated as the supplied transaction granularity; duplicate transactions are not silently aggregated by validation. Negative sales, returns and invalid quantities are reported, never rewritten as zero. Input validation is separate from demand preprocessing. Files stay in memory in the dashboard session.
 
-Приватность: сервис работает только с обезличенным ID клиента и нужен ему лишь для поиска разовых заказов. В выходные файлы ID клиента не попадает.
+Templates can be downloaded from the sidebar. If stock history is absent, the app says stockout correction is unavailable; zero sales alone never imply a stockout.
 
-## Методология
+Use anonymized values in `client_id`. The validator blocks common direct personal-data columns such as customer name, phone, email, IIN and address. Without `client_id`, the integrated engine can still limit daily outliers, but it cannot verify a one-off large order by one customer.
 
-### 1. Очистка и агрегация
-Некорректные даты, пустые артикулы и отрицательные количества (возвраты) отбрасываются, число отброшенных строк пишется в лог. Точные дубликаты удаляются. Продажи агрегируются по дням. Дни без продаж заполняются нулями от первой продажи артикула до последней даты выгрузки. Остатки берутся как последний снимок на дату по каждому складу и затем суммируются по складам.
+## Engines and calculations
 
-### 2. Исключение разовых крупных заказов и выбросов
-Используются **только прошлые данные**, поэтому нет утечки будущего.
+**Demo engine** works without teammate modules or API keys. It uses the latest 28 calendar days' average sales, an optional recent growth adjustment, and transparent replenishment arithmetic. With an aggregate inventory transit quantity it assumes goods arrive within the protection horizon. It does not claim to model seasonality, detect production anomalies, correct stockouts, or establish forecast accuracy. MOQ and order-multiple rounding apply only when supplied and the raw order is positive.
 
-1. **Крупный заказ одного клиента.** Считается суммарное количество клиента по артикулу за день. Оно сравнивается с распределением прежних заказов этого артикула. Порог: `max(Q3 + 3·IQR, медиана + 6·1.4826·MAD, 3·медиана)`, проверка начинается после 7 наблюдений. Если заказ выше порога, он заменяется медианным обычным заказом: разовая часть исключается из спроса, обычная потребность клиента сохраняется.
-2. **Дневной выброс по артикулу.** Если спрос за день больше `Q3 + 1.5·IQR` за предыдущие 90 дней без дефицита, он ограничивается этой границей. Этот шаг ловит крупные заказы без ID клиента.
+**Integrated engine** requires the forecasting and replenishment providers described in [docs/integration_contract.md](docs/integration_contract.md). It calls Person 1 first, then Person 2. Missing or incompatible modules surface an actionable error; there is no silent demo fallback. The existing `src.pipeline` remains a separate command-line forecast report until the forecasting workstream adds the provider bridge.
 
-Исходное количество остаётся в аудите (`data/processed/transactions_audit.csv`, `daily_demand.csv`), а в обоснование пишется, сколько единиц исключено.
+## Manager review and exports
 
-### 3. Упущенный спрос (stockout)
-День считается днём дефицита, если в продажах стоит флаг «Нет в наличии», если суммарный остаток равен 0 или если день попадает в период из `--stockouts`. Ожидаемый спрос в такой день равен медиане предыдущих 14 надёжных дней (без дефицита и аномалий); если таких дней нет, берётся медиана всей прошлой истории. Упущенный спрос = `max(ожидаемый − продано, 0)`. Скорректированный спрос = продажи + упущенный спрос.
+Review selections, editable quantities and comments live in Streamlit session state, keyed by calculation run and SKU. Any input or setting change makes the previous result stale and blocks exports until recalculation. The manager must confirm the draft before approved-lines export. This is a local demo interaction, not authentication or a durable audit trail. Downloading exports does not submit an order. Spreadsheet-formula-like text is sanitized.
 
-### 4. Прогноз спроса
-Используется одна общая модель RandomForest на все артикулы (100 деревьев, seed 42). Признаки: календарь (день недели, неделя, месяц, годовые sin/cos), лаги 1/7/14/28, скользящие средние, медианы и стандартные отклонения, темп роста. Все признаки строятся по данным до целевого дня. Прогноз рекурсивный. Для каждого артикула модель выбирается, только если на валидации она лучше базовой 7-дневной средней, иначе используется базовая средняя.
+Exports include visible-recommendation CSV and an Excel workbook with recommendations, supplier summary, purchase draft, data quality and run metadata. Mixed currencies are never totaled together; missing prices are not treated as zero.
 
-### 5. Расчёт заказа (`src/ordering.py`)
-Используется политика «пополнение до уровня»:
+## Team connection points
 
-```
-покрытие   = срок поставки + период пересмотра
-спрос      = Σ прогноз модели за покрытие × годовая сезонность × устойчивый тренд × (1 + плановый прирост)
-страховой  = z × σ ошибки прогноза × √покрытие     (σ ≈ 1.25·MAE на валидации, иначе σ спроса за 90 дн.)
-потребность = спрос + страховой − (остаток + в пути)
-заказ      = потребность, округлённая вверх до кратности, не меньше минимальной партии
-```
+- Person 1: forecasting provider `forecast(data: InputBundle, settings: AnalysisSettings)`.
+- Person 2: replenishment provider `recommend(data, settings, forecast_bundle)`.
+- Integration adapter: `integration/adapter.py` is the only frontend-facing provider boundary.
 
-- **Годовая сезонность.** Берётся спрос прошлого года в том же окне и делится на спрос прошлого года за 28 дней до этого окна. Сдвиг ровно на 52 недели сохраняет дни недели. Множитель ограничен диапазоном [0.5; 2]. Применяется, если история длиннее года.
-- **Устойчивый тренд.** Если история длиннее года, тренд считается как рост последних 28 дней к тем же дням прошлого года, поэтому сезонность на него не влияет. Если история короче, нужны два подряд месячных изменения одного знака, каждое больше 3%. Тренд продлевается на половину периода покрытия, множитель ограничен диапазоном [0.8; 1.25]. Случайные колебания трендом не считаются.
-- **Недельная сезонность** учитывается самой моделью через признак дня недели и лаг 7.
-- **Срочность:** `критично`, если запаса хватит меньше, чем на срок поставки; `высокая`, если меньше, чем на покрытие; `плановая` для остальных заказов; `не требуется`, если заказывать не нужно. Внутри поставщика позиции отсортированы по срочности и запасу в днях.
-- **Обоснование** на русском содержит все числа, из которых получилось количество, а также размер поправки на упущенный спрос и исключённых разовых заказов. Поле `raw_sales_need` показывает для сравнения, какой была бы потребность по «сырым» продажам.
-
-## Результаты
-
-| Файл | Содержание |
-|---|---|
-| `outputs/supplier_orders.xlsx` | Лист «Сводка» по поставщикам, лист «Все позиции» и отдельный лист на каждого поставщика |
-| `outputs/supplier_orders_1c.csv` | Позиции к заказу для импорта в 1С/Excel: разделитель `;`, UTF-8 BOM, русские заголовки |
-| `outputs/supplier_orders.csv` | Все поля расчёта (множители, запасы, сравнение с «сырыми» продажами) |
-| `outputs/approved/*.xlsx, *_1c.csv` | Утверждённые в дашборде заказы с ФИО ответственного и временем утверждения |
-| `outputs/forecast_output.csv`, `daily_forecast.csv` | Прогноз спроса по артикулам и по дням |
-| `outputs/metrics.json`, `validation_predictions.csv` | Качество прогноза на отложенном периоде |
-| `data/processed/*.csv` | Аудит: исходное и очищенное количество, флаги аномалий и дефицита |
-
-Колонки заказа: Поставщик, Артикул, Наименование, Категория, Рекомендуемое количество, Утверждённое количество (редактируется), Срочность, Запас (дн.), Срок поставки, Спрос на период, Страховой запас, Остаток, В пути, Цена, Сумма, Обоснование, Статус (`черновик — требует утверждения`).
-
-## Тесты и соответствие требованиям кейса
-
-В `tests/test_ordering.py` каждая проверка из раздела Must have оформлена отдельным тестом. В `tests/test_pipeline.py` проверяются очистка данных, отсутствие утечки будущего и форматы входных файлов. Всего 32 теста.
-
-| Must have | Проверка из ТЗ | Тест |
-|---|---|---|
-| 1. Учитываются все источники | Изменение остатка, товаров в пути, истории, срока поставки (из справочника), прироста категории, кратности или минимальной партии меняет итоговое количество | `MustHave1AllSourcesAffectResult` (9 тестов с точными ожидаемыми значениями) |
-| 2. Сезонность и рост | Для товара с летним пиком заказ больше, чем при расчёте по средней за всю историю (×1.4+). Прогноз модели повторяет недельный цикл (выходные > 3× будни). Устойчивый рост продлевается, случайный шум трендом не считается | `MustHave2SeasonalityAndGrowth` |
-| 3. Упущенный спрос | Заказ по артикулу с дефицитом больше, чем расчёт по «сырым» продажам. Периоды из отдельной таблицы stockout тоже учитываются | `MustHave3LostDemand` |
-| 4. Разовые крупные заказы | Добавленный заказ клиента на 1000 ед. меняет рекомендуемое количество не больше чем на 5%, хотя без исключения потребность выросла бы в 3+ раза. Крупный заказ без ID клиента тоже отсекается | `MustHave4OneOffOrders` |
-| 5. Список по поставщикам с обоснованием | Сквозной запуск: позиции сгруппированы по поставщикам, в каждой строке есть обоснование с итоговым количеством, в XLSX есть лист на поставщика, CSV для 1С открывается, фильтр по категории работает, статус «требует утверждения» | `MustHave5SupplierListWithReasons` |
-
-Тесты проверялись на поломках: если отключить учёт товаров в пути, коррекцию stockout, исключение крупных заказов или сезонные множители, соответствующие тесты падают.
-
-Опциональные пункты кейса: приоритизация по риску дефицита (срочность и запас в днях), минимальная партия и кратность, графики трендов по категориям (вкладка в дашборде), выгрузка заказа поставщику в виде файла после ручного утверждения.
-
-## Проверка на синтетических данных
-
-Синтетика: 20 артикулов, 400 дней, недельный и годовой циклы, растущие и падающие товары, 4 поставщика со сроками 7–28 дней, запас от 5 до 60 дней. Недавние аномалии: у SKU003 разовый заказ на 600 ед. за 5 дней до конца истории, у SKU005 дефицит последние 5 дней (есть флаг в продажах), у SKU010 дефицит последние 4 дня (известен только из `stockouts.csv`).
-
-| Артикул | Ситуация | Расчёт по «сырым» продажам | Рекомендация |
-|---|---|---:|---:|
-| SKU003 | разовый заказ 600 ед. | 798 | 190 |
-| SKU005 | дефицит, флаг в продажах | 199 | 230 (критично) |
-| SKU010 | дефицит из отдельной таблицы, 90 ед. в пути | 1001 | 1783 (критично) |
-
-Итого: 11 позиций «критично», 3 «высокая», 6 «не требуется».
-
-Качество прогноза на отложенных 20% дат (1 567 надёжных SKU-дней, 33 дня с дефицитом или аномалией исключены):
-
-| Модель | MAE | RMSE | MAPE |
-|---|---:|---:|---:|
-| Рекурсивная 7-дневная средняя | 8.33 | 11.53 | 29.9% |
-| RandomForest | 5.56 | 7.58 | 20.5% |
-
-`python -m src.demonstrate`: заказ на 1000 ед. за последний день меняет 30-дневный прогноз SKU001 на −0.24%. Это синтетические данные, а не оценка точности на реальных данных компании.
-
-## Архитектура
-
-```text
-main.py                       # CLI
-app.py                        # Streamlit: расчёт, просмотр, корректировка, утверждение
-src/
-  config.py                   # синонимы колонок, параметры политики запасов
-  data_loader.py              # CSV/XLSX, сопоставление колонок, справочники
-  preprocessing.py            # очистка, дневная агрегация, остатки по складам
-  anomaly_detection.py        # разовые заказы клиентов, дневные выбросы (IQR/MAD)
-  stockout.py                 # периоды отсутствия, упущенный спрос
-  feature_engineering.py      # лаги, скользящие, календарь, рост
-  forecasting.py              # модель и рекурсивный прогноз
-  evaluation.py               # хронологическая валидация, MAE/RMSE/MAPE
-  ordering.py                 # расчёт заказа, срочность, обоснование, экспорт
-  pipeline.py                 # оркестрация
-  generate_synthetic_data.py  # синтетика + справочники
-  demonstrate.py              # проверки чувствительности
-tests/
-  test_ordering.py            # приёмочные тесты по Must have
-  test_pipeline.py            # очистка, утечки, форматы
-```
-
-## Допущения и ограничения
-
-- Пропущенный день в выгрузке означает, что продаж не было. Нужна полная выгрузка продаж.
-- Остаток в продажах считается снимком на конец дня по складу. Для актуального расчёта лучше передавать свежие остатки через `--stock`: в отчёте указано, на какую дату взят остаток (`stock_as_of`).
-- Если у артикула несколько поставщиков, берётся последний указанный или тот, что в номенклатуре. Распределение заказа между несколькими поставщиками не реализовано.
-- Оценка упущенного спроса приблизительная. Для нового товара без истории её нет.
-- Годовая сезонность оценивается по одному прошлому году: при истории больше года используется сдвиг на 52 недели. Лесная модель плохо продолжает тренды, поэтому тренд вынесен в отдельный прозрачный множитель.
-- Уровень «уверенности» — эвристика, а не доверительный интервал. Модель выбиралась на той же валидации, поэтому для оценки качества в продакшене нужен отдельный период.
-- Файл модели `models/demand_model.joblib` нельзя загружать из недоверенных источников.
-
-
----
-
-# StockPilot UI and integration workstream
-
-This addendum is intended to be appended to the existing repository README. It preserves the forecasting methodology already documented there.
-
-Install the updated `requirements.txt`, then launch with `streamlit run app.py`. Use the sidebar to load synthetic data or upload an `.xlsx` workbook (`sales`, `inventory`, `suppliers`, optional `stock_history` sheets) or the equivalent CSV files. Validate before calculating. The app offers a Russian-language purchasing dashboard, per-SKU history and forecast charts, supplier filters, editable manager review, and CSV/Excel exports.
-
-The demo engine is deterministic and approximate: trailing 28-day mean, a recent growth estimate or explicit growth assumption, a transparent lead-time/review-horizon replenishment calculation, and optional MOQ/pack rounding. It does not run the production forecast model and does not claim stockout correction, seasonality, measured accuracy or savings. Integrated mode calls the repository's forecasting functions and then `src.ordering.recommend_orders` through `integration/existing_provider.py`. See `docs/integration_contract.md` for signatures and schemas.
-
-Run `pytest -q` for frontend/integration checks. Manager review is session-local, requires explicit confirmation before approved-line export, and does not submit orders or modify an ERP. Exports are draft files only.
+See [docs/integration_contract.md](docs/integration_contract.md) and [docs/demo_script.md](docs/demo_script.md) for schemas, assumptions and a short presentation path.
 
