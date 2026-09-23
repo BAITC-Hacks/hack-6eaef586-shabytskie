@@ -9,19 +9,22 @@ from frontend.charts import priority_chart, sku_chart
 from frontend.components import hero, metric_row
 from frontend.data_io import read_table, read_workbook, templates_xlsx
 from frontend.exports import csv_bytes, workbook_bytes
+from frontend.review import build_draft, missing_override_comments, review_signature
 from frontend.validation import validate_bundle
 from integration.adapter import run_analysis
 from data.generate_demo import generate_demo
 
 st.set_page_config(page_title="StockPilot · закупки",page_icon="📦",layout="wide")
 st.markdown("""<style>
-.stApp{font-family:system-ui,sans-serif;background:#f5f7f6}.block-container{max-width:1440px;padding-top:1.6rem}
+.stApp{font-family:system-ui,sans-serif;background:linear-gradient(180deg,#edf5f1 0,#f7f9f8 240px)}.block-container{max-width:1440px;padding-top:1.6rem}
 .status-row{display:flex;gap:8px;margin:0 0 1rem}.badge{padding:5px 10px;border-radius:99px;background:#173e36;color:#fff;font-size:11px;font-weight:800;letter-spacing:.08em}.badge.soft{background:#e2ede8;color:#285c4c}
 div[data-testid=stMetric]{background:#fff;padding:14px 17px;border:1px solid #e4e9e6;border-radius:12px}
 h1,h2,h3{letter-spacing:-.025em}.stButton>button{border-radius:9px;font-weight:700}.stDownloadButton>button{border-radius:9px}
+.workflow{background:#fff;border:1px solid #dde7e2;border-radius:12px;padding:12px 16px;margin:.25rem 0 1.1rem;color:#3d5d53;font-size:.9rem}.workflow b{color:#173e36}.workflow span{color:#98aaa4;padding:0 8px}
 </style>""",unsafe_allow_html=True)
 st.title("StockPilot")
 st.caption("Рекомендации по пополнению запасов · Электрокомплект")
+st.markdown('<div class="workflow"><b>1. Данные</b><span>→</span><b>2. Расчёт</b><span>→</span><b>3. Проверка</b><span>→</span><b>4. Экспорт черновика</b></div>',unsafe_allow_html=True)
 
 for k,v in {"bundle":None,"result":None,"input_fingerprint":None,"approved":False,"approved_signature":None,"review":{}}.items(): st.session_state.setdefault(k,v)
 
@@ -104,27 +107,37 @@ with overview:
     with left: st.subheader("Приоритеты"); priority_chart(rec)
     with right:
         st.subheader("Поставщики")
-        summary=buy.groupby("supplier",as_index=False).agg(SKU=("sku","nunique"),Количество=("recommended_order","sum"))
+        group_cols=["supplier"] + (["unit"] if "unit" in buy else [])
+        summary=buy.groupby(group_cols,as_index=False,dropna=False).agg(SKU=("sku","nunique"),Количество=("recommended_order","sum"))
+        summary=summary.rename(columns={"supplier":"Поставщик","unit":"Единица"})
         st.dataframe(summary,use_container_width=True,hide_index=True)
 with recommendations:
     st.subheader("Предложения поставщикам")
-    c1,c2,c3,c4,c5=st.columns([1.2,1,1,1,1])
+    c1,c2,c3,c4,c5,c6=st.columns([1.2,1,1,1,1,1.2])
     query=c1.text_input("Поиск SKU или названия")
     suppliers=c2.multiselect("Поставщик",sorted(rec.supplier.astype(str).unique()))
     categories=c3.multiselect("Категория",sorted(rec.category.dropna().astype(str).unique()) if "category" in rec else [])
     priorities=c4.multiselect("Приоритет",["HIGH","MEDIUM","LOW"],default=["HIGH","MEDIUM","LOW"])
     only=c5.checkbox("Только к закупке",True)
+    sort_by=c6.selectbox("Сортировка",["Приоритет и количество","Количество","Поставщик","SKU"])
     visible=rec.copy()
     if query:
         names=visible.product_name.astype(str) if "product_name" in visible else visible.sku.astype(str)
-        visible=visible[visible.sku.astype(str).str.contains(query,case=False)|names.str.contains(query,case=False)]
+        visible=visible[visible.sku.astype(str).str.contains(query,case=False,regex=False,na=False)|names.str.contains(query,case=False,regex=False,na=False)]
     if suppliers: visible=visible[visible.supplier.astype(str).isin(suppliers)]
     if categories and "category" in visible: visible=visible[visible.category.astype(str).isin(categories)]
     if priorities: visible=visible[visible.priority.astype(str).str.upper().isin(priorities)]
     if only: visible=visible[visible.recommended_order>0]
     st.caption(f"Отображается {len(visible)} из {len(rec)} SKU; KPI рассчитаны по полному набору.")
     cols=[c for c in ["sku","product_name","supplier","category","forecast","horizon_days","current_stock","in_transit","safety_stock","recommended_order","priority","reason"] if c in visible]
-    st.dataframe(visible[cols].sort_values(["priority","recommended_order"],ascending=[True,False]),use_container_width=True,hide_index=True)
+    if visible.empty:
+        st.info("По выбранным фильтрам рекомендаций нет. Измените поиск или фильтры.")
+    else:
+        priority_rank={"HIGH":0,"MEDIUM":1,"LOW":2}
+        visible["_priority_rank"]=visible.priority.astype(str).str.upper().map(priority_rank).fillna(9)
+        sort_options={"Приоритет и количество":(["_priority_rank","recommended_order"],[True,False]),"Количество":(["recommended_order"],[False]),"Поставщик":(["supplier","sku"],[True,True]),"SKU":(["sku"],[True])}
+        sort_cols,ascending=sort_options[sort_by]
+        st.dataframe(visible.sort_values(sort_cols,ascending=ascending)[cols],use_container_width=True,hide_index=True)
     visible_export=visible[cols].copy(); visible_export["export_status"]="DRAFT"
     st.download_button("CSV видимых рекомендаций",csv_bytes(visible_export),"stockpilot_recommendations.csv","text/csv")
 with detail:
@@ -152,15 +165,16 @@ with review_tab:
     review["comment"]=[st.session_state.review[(run_id,str(s))]["comment"] for s in review.sku]
     edited=st.data_editor(review,use_container_width=True,hide_index=True,num_rows="fixed",column_config={"selected":st.column_config.CheckboxColumn("В заказ"),"final_quantity":st.column_config.NumberColumn("Итоговое количество",min_value=0,step=0.1),"comment":st.column_config.TextColumn("Комментарий",max_chars=200)})
     for r in edited.itertuples(index=False): st.session_state.review[(run_id,str(r.sku))]={"selected":bool(r.selected),"quantity":float(r.final_quantity),"comment":str(r.comment)}
-    review_signature=repr(sorted((str(s),v["selected"],v["quantity"],v["comment"]) for (rid,s),v in st.session_state.review.items() if rid==run_id))
-    if st.session_state.approved and st.session_state.approved_signature!=review_signature:
+    current_review_signature=review_signature(st.session_state.review,run_id)
+    if st.session_state.approved and st.session_state.approved_signature!=current_review_signature:
         st.session_state.approved=False; st.session_state.approved_signature=None
-    draft=edited[edited.selected&(edited.final_quantity>0)].copy().rename(columns={"recommended_order":"original_recommended_order","final_quantity":"approved_quantity"})
-    if "supplier" in draft: draft=draft.sort_values(["supplier","sku"])
-    changed=any(st.session_state.review[(run_id,str(r.sku))]["quantity"]!=float(buy.loc[buy.sku.astype(str)==str(r.sku),"recommended_order"].iloc[0]) for r in edited.itertuples(index=False))
+    draft=build_draft(edited,result.metadata)
+    missing_comments=missing_override_comments(edited)
+    changed=bool((edited.final_quantity.astype(float)!=edited.recommended_order.astype(float)).any())
     if changed: st.caption("Ручные изменения сохранены отдельно; исходная рекомендация остаётся неизменной.")
-    if st.button("Подтвердить состав черновика",type="primary",key="approve"):
-        st.session_state.approved=True; st.session_state.approved_signature=review_signature
+    if missing_comments: st.warning("Добавьте комментарий к изменённому количеству: " + ", ".join(missing_comments))
+    if st.button("Подтвердить состав черновика",type="primary",key="approve",disabled=bool(missing_comments) or draft.empty):
+        st.session_state.approved=True; st.session_state.approved_signature=current_review_signature
     if st.session_state.approved: st.success("Состав черновика подтверждён в текущей сессии.")
     else: st.warning("Черновик не подтверждён. Подтвердите его для экспорта утверждённых строк.")
     draft["status"]="APPROVED_LOCAL" if st.session_state.approved else "DRAFT"
