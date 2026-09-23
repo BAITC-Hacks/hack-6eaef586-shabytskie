@@ -114,15 +114,26 @@ def current_inventory(daily: pd.DataFrame, stock: pd.DataFrame | None = None) ->
 
 
 def annual_factor(group: pd.DataFrame, start: pd.Timestamp, coverage: int) -> float | None:
-    series = group.set_index('date').adjusted_demand
+    history = group.set_index('date')
+    # Daily outlier caps can suppress a sustained seasonal transition. Estimate
+    # the already-observed annual shape from sales, robustly clipping the tails
+    # within each window. Stockout days still use the imputed demand.
+    series = history.quantity.where(~history.stockout_flag, history.adjusted_demand)
     # Отношение спроса прошлого года в будущем окне к 28 дням перед ним.
     # Сдвиг на 52 недели (364 дня) сохраняет совпадение дней недели.
     origin = start - pd.Timedelta(days=364)
     window = series[origin:origin + pd.Timedelta(days=coverage - 1)]
     base = series[origin - pd.Timedelta(days=28):origin - pd.Timedelta(days=1)]
-    if len(window) < coverage or len(base) < 28 or base.mean() <= 0:
+    if len(window) < coverage or len(base) < 28:
         return None
-    return float(np.clip(window.mean() / base.mean(), .5, 2.))
+    def typical_mean(values):
+        if values.eq(0).mean() > .3:
+            return values.mean()  # Preserve intermittent demand, including zero days.
+        return values.clip(lower=values.quantile(.1), upper=values.quantile(.9)).mean()
+    base_level = typical_mean(base)
+    if base_level <= 0:
+        return None
+    return float(np.clip(typical_mean(window) / base_level, .25, 4.))
 
 
 def trend_factor(group: pd.DataFrame, coverage: int) -> tuple[float, float | None]:
@@ -185,13 +196,14 @@ def recommend_orders(daily: pd.DataFrame, future: pd.DataFrame, config: Config,
         lead = int(p.lead_time_days)
         coverage = lead + config.review_period_days
         model_demand = forecast_window(future, sku, start, coverage)
-        forecast_method = future.loc[future.sku == sku, 'model_used'].iloc[0]
-        # RandomForest already receives month and annual sin/cos features. The
-        # explicit annual factor is only a fallback for moving-average methods.
-        seasonal = None if forecast_method == 'random_forest' else annual_factor(group, start, coverage)
+        seasonal = annual_factor(group, start, coverage)
+        # Use either a recent level with a historical seasonal shape, or the
+        # model forecast. Multiplying both would count seasonality twice.
+        demand_base = group.adjusted_demand.tail(28).mean() * coverage if seasonal is not None else model_demand
+        demand_method = 'уровень за 28 дней × годовая сезонность' if seasonal is not None else 'прогноз модели'
         trend, monthly = trend_factor(group, coverage)
         plan = planned_growth(growth, sku, p.category)
-        demand = model_demand * (seasonal or 1.) * trend * (1 + plan)
+        demand = demand_base * (seasonal or 1.) * trend * (1 + plan)
         daily_rate = demand / coverage
 
         # σ берётся из ошибки прогноза на валидации (σ ≈ 1.25·MAE), без неё — из разброса спроса.
@@ -239,6 +251,7 @@ def recommend_orders(daily: pd.DataFrame, future: pd.DataFrame, config: Config,
                    days_of_cover=(round(days_of_cover, 1)
                                   if days_of_cover is not None and np.isfinite(days_of_cover) else None),
                    lead_time_days=lead, coverage_days=coverage, model_demand=round(model_demand, 2),
+                   demand_base=round(demand_base, 2), demand_method=demand_method,
                    seasonal_factor=round(seasonal, 4) if seasonal else None, trend_factor=round(trend, 4),
                    planned_growth=plan, demand_for_coverage=round(demand, 1), safety_stock=round(safety, 1),
                    stock=on_hand, stock_as_of=inv.stock_as_of, in_transit=in_transit, net_need=round(need, 1),
@@ -257,7 +270,8 @@ def recommend_orders(daily: pd.DataFrame, future: pd.DataFrame, config: Config,
 
 def explain(row: dict, monthly: float | None, error_source: str) -> str:
     parts = [f"Покрытие {row['coverage_days']} дн. (поставка {row['lead_time_days']} + пересмотр "
-             f"{row['coverage_days'] - row['lead_time_days']}): прогноз модели {row['model_demand']:.0f} ед."]
+             f"{row['coverage_days'] - row['lead_time_days']}): {row['demand_method']}, "
+             f"база {row['demand_base']:.0f} ед."]
     if row['seasonal_factor']:
         parts.append(f"годовая сезонность ×{row['seasonal_factor']:.2f}")
     if monthly is not None:

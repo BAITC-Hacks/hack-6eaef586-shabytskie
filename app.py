@@ -255,7 +255,7 @@ with tab_card:
         st.subheader('Как получилось количество')
         fmt = lambda v, unit='ед.': f'{v:,.0f} {unit}'.replace(',', ' ') if pd.notna(v) else '—'
         steps = [
-            (f"Прогноз модели на {item.coverage_days} дн.", fmt(item.model_demand)),
+            (f"База спроса на {item.coverage_days} дн.", fmt(item.get('demand_base', item.model_demand))),
             ('× годовая сезонность', f'{item.seasonal_factor:.2f}' if pd.notna(item.seasonal_factor) else '— (история < года)'),
             ('× устойчивый тренд', f'{item.trend_factor:.2f}'),
             ('× плановый прирост', f'{1 + item.planned_growth:.2f}'),
@@ -269,6 +269,8 @@ with tab_card:
         ]
         st.dataframe(pd.DataFrame(steps, columns=['Шаг', 'Значение']), hide_index=True, width='stretch',
                      height=36 * (len(steps) + 1) + 3)
+        st.caption(f"Метод заказа: {item.get('demand_method', 'прогноз модели')}. "
+                   'Прогноз модели показан на графике отдельно.')
     with right:
         st.subheader('События за 120 дней')
         events = pd.concat([

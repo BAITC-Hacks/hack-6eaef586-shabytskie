@@ -52,7 +52,7 @@ This is a scoped review count, not a guarantee that no other vulnerability exist
 | Check | Result |
 |---|---|
 | Baseline regression suite | 44 tests passed before changes |
-| Final project/security suite | 85 tests passed, including 41 added checks |
+| Final project/security suite | 87 tests passed: 44 baseline, 41 security/UI checks, 2 newly merged team acceptance tests |
 | Streamlit AppTest | Demo startup/calculation/approval; production missing-config and invalid-mode fail closed |
 | Real local worker | CSV upload, preserved SKU leading zeros, outputs, raw-input cleanup, privacy and analyst approval denial passed |
 | Malicious input checks | Extension/MIME/path, binary disguises, oversize, ZIP/XML expansion, formulas, external links, macros, sheets and calendar limits passed |
@@ -85,6 +85,15 @@ on the IPv6 listener after SIGTERM; it was stopped and replaced. Both localhost 
 127.0.0.1 then returned healthy responses, and the UI/demo ran again. The original
 traceback was not available, so the underlying old-process exception is not claimed
 to be diagnosed. Restart the server after dependency/module changes.
+
+During final synchronization, upstream a7873cf added two acceptance tests and changed
+a seasonality assertion. They exposed existing demand-calculation weaknesses:
+sharp seasonal transitions were underestimated, and capping an anonymous bulk sale
+still inflated recent model lags. A separate follow-up change uses a robust observed
+annual shape with the recent demand level (without multiplying seasonality into
+the model forecast twice), replaces extreme anonymous spikes with a past-only
+median, and explains the selected demand basis in the UI. All three previously
+failing assertions now pass. These are functional fixes, not extra security findings.
 
 ## Changes and control boundaries
 
