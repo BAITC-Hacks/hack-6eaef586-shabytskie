@@ -38,8 +38,16 @@ def forecast(data: InputBundle, settings: AnalysisSettings) -> ForecastBundle:
     frame = frame[pd.to_datetime(frame.date, errors="coerce") <= pd.Timestamp(settings.as_of_date)].copy()
     if frame.empty:
         raise ValueError("No sales rows exist on or before the selected as-of date.")
-    metadata_cols = [c for c in ["sku", "product_name", "category", "supplier", "unit_cost"] if c in data.inventory]
-    frame = frame.merge(data.inventory[metadata_cols].rename(columns={"unit_cost": "price"}), on="sku", how="left", validate="many_to_one")
+    metadata_cols = ["sku"] + [
+        c for c in ["product_name", "category", "supplier", "unit_cost"]
+        if c in data.inventory and (c not in frame or c == "unit_cost")
+    ]
+    if len(metadata_cols) > 1:
+        metadata = data.inventory[metadata_cols].rename(columns={"unit_cost": "price"})
+        if "price" in frame and "price" in metadata:
+            metadata = metadata.drop(columns="price")
+        if len(metadata.columns) > 1:
+            frame = frame.merge(metadata, on="sku", how="left", validate="many_to_one")
     config = Config(forecast_days=max(30, int(suppliers.lead_time_days.max()) + settings.review_period_days),
                     review_period_days=settings.review_period_days,
                     service_level_z=1.65 if settings.safety_stock_days else 0.0)
