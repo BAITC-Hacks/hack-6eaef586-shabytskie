@@ -6,6 +6,7 @@ from contracts import InputBundle
 
 REQUIRED = {"sales": {"date", "sku", "quantity"}, "inventory": {"sku", "product_name", "category", "supplier", "current_stock", "in_transit"}, "suppliers": {"supplier", "lead_time_days"}}
 NUMERIC = {"sales": ["quantity"], "inventory": ["current_stock", "in_transit", "unit_cost", "moq", "order_multiple"], "suppliers": ["lead_time_days"]}
+PERSONAL_DATA_COLUMNS = {"customer_name", "client_name", "email", "phone", "telephone", "iin", "address"}
 
 
 def validate_bundle(bundle: InputBundle) -> list[str]:
@@ -20,6 +21,9 @@ def validate_bundle(bundle: InputBundle) -> list[str]:
         missing = REQUIRED.get(name, set()) - set(df.columns)
         if missing:
             errors.append(f"{name}: missing required columns: {', '.join(sorted(missing))}.")
+        personal = PERSONAL_DATA_COLUMNS & {str(col).strip().casefold() for col in df.columns}
+        if personal:
+            errors.append(f"{name}: personal customer columns are not allowed: {', '.join(sorted(personal))}. Use anonymized client_id.")
         if "sku" in df and df.sku.isna().any():
             errors.append(f"{name}.sku: {int(df.sku.isna().sum())} rows have missing SKU identifiers.")
         if "supplier" in df and df.supplier.isna().any():
@@ -27,6 +31,8 @@ def validate_bundle(bundle: InputBundle) -> list[str]:
         if "date" in df:
             parsed = pd.to_datetime(df.date, errors="coerce")
             if parsed.isna().any(): errors.append(f"{name}.date: {int(parsed.isna().sum())} values are missing or invalid.")
+        if name == "sales" and "client_id" in df and df.client_id.isna().any():
+            errors.append(f"sales.client_id: {int(df.client_id.isna().sum())} rows are missing anonymized customer IDs.")
         required_numeric = {"sales": {"quantity"}, "inventory": {"current_stock", "in_transit"}, "suppliers": {"lead_time_days"}}
         for col in NUMERIC.get(name, []):
             if col in df:
