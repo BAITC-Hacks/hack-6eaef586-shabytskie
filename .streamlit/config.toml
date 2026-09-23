@@ -5,6 +5,8 @@ maxUploadSize = 100
 [browser]
 gatherUsageStats = false
 
-[theme]
-base = "light"
+[theme.light]
 primaryColor = "#2a78d6"
+
+[theme.dark]
+primaryColor = "#78adff"

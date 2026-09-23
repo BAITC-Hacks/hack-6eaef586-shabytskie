@@ -1,4 +1,3 @@
-import shutil
 import tempfile
 from datetime import datetime
 from io import BytesIO
@@ -26,7 +25,8 @@ INPUTS = {
     'growth': ('Прогноз прироста', 'category_growth.csv', 'Категория или Артикул, Прирост (10% или 0.1)'),
 }
 
-st.set_page_config(page_title='Заказы поставщикам', page_icon='📦', layout='wide')
+st.set_page_config(page_title='Заказы поставщикам',
+                   page_icon=str(Path(__file__).resolve().parent / 'site-icon.jpg'), layout='wide')
 
 
 def demo_paths() -> dict:
@@ -70,12 +70,8 @@ def demo_result() -> Path:
 
 
 def new_session_dir() -> Path:
-    if 'workdir' not in st.session_state:
-        st.session_state.workdir = Path(tempfile.mkdtemp(prefix='orders_'))
-    root = st.session_state.workdir
-    shutil.rmtree(root, ignore_errors=True)
-    root.mkdir(parents=True)
-    return root
+    # Keep the last successful result intact if a new calculation fails.
+    return Path(tempfile.mkdtemp(prefix='orders_'))
 
 
 @st.cache_data(show_spinner=False)
@@ -126,7 +122,7 @@ def demand_chart(history: pd.DataFrame, forecast: pd.DataFrame) -> alt.LayerChar
             tooltip=[alt.Tooltip('date:T', title='Разовый заказ', format='%d.%m.%Y'),
                      alt.Tooltip('quantity:Q', title='Продано', format='.0f'),
                      alt.Tooltip('excluded:Q', title='Исключено', format='.0f')]),
-        alt.Chart(one_off).mark_text(dx=8, align='left', baseline='middle', fontSize=11, color='#52514e').encode(
+        alt.Chart(one_off).mark_text(dx=8, align='left', baseline='middle', fontSize=11).encode(
             x='date:T', y=point_y, text='label:N'),
     ]
     wide = lines.pivot_table(index='date', columns='series', values='value').reset_index()
@@ -192,7 +188,17 @@ if 'result_dir' not in st.session_state:
     st.stop()
 
 result_dir = st.session_state.result_dir
-orders, daily, future = load_results(str(result_dir), (result_dir / 'outputs' / 'supplier_orders.csv').stat().st_mtime)
+try:
+    orders, daily, future = load_results(str(result_dir), (result_dir / 'outputs' / 'supplier_orders.csv').stat().st_mtime)
+except FileNotFoundError:
+    st.session_state.pop('result_dir', None)
+    st.session_state.pop('approved_file', None)
+    if result_dir.name.startswith('demo_orders_'):
+        demo_result.clear()
+    st.warning('Файлы предыдущего расчёта недоступны. Проверьте склад и категорию '
+               '(это названия, а не артикул товара) и нажмите «Запустить расчёт». '
+               'Для расчёта по всем товарам оставьте оба поля пустыми.')
+    st.stop()
 st.caption(f"Расчёт по: {st.session_state.get('calculated_from', '—')}. Заказ — черновик, поставщику ничего не отправляется.")
 
 active = orders[orders.recommended_qty > 0]
