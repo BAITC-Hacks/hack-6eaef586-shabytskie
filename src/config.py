@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+from src.security import bounded_number
 
 ALIASES = {
     'date': ['date', 'sale_date', 'Дата', 'Дата продажи'],
@@ -35,11 +36,12 @@ class Config:
     review_period_days: int = 7
     default_lead_time_days: int = 14
     service_level_z: float = 1.65  # ≈ 95% уровень сервиса
+    persist_model: bool = True
+    write_transaction_audit: bool = True
 
     def __post_init__(self) -> None:
-        if self.forecast_days < 1:
-            raise ValueError('forecast_days must be positive')
-        if self.review_period_days < 1 or self.default_lead_time_days < 1:
-            raise ValueError('review_period_days and default_lead_time_days must be positive')
-        if self.service_level_z < 0:
-            raise ValueError('service_level_z must be non-negative')
+        for field, minimum, maximum in [('forecast_days', 1, 365), ('review_period_days', 1, 90),
+                                         ('default_lead_time_days', 1, 275), ('min_history', 7, 365),
+                                         ('random_state', 0, 2**32 - 1)]:
+            bounded_number(getattr(self, field), field, minimum, maximum, integer=True)
+        bounded_number(self.service_level_z, 'service_level_z', 0, 4)

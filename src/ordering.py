@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 from src.config import Config
 from src.preprocessing import SPACES
+from src.secure_files import spreadsheet_safe, safe_sheet_name
+from src.security import MAX_QUANTITY, SecurityError, bounded_number
 
 URGENCY_ORDER = {'требуются данные': -1, 'критично': 0, 'высокая': 1, 'плановая': 2, 'не требуется': 3}
 STATUS_DRAFT = 'черновик — требует утверждения'
@@ -35,6 +37,8 @@ def _number(value, default=None):
         number = float(re.sub(SPACES, '', str(value)).replace(',', '.'))
     except (TypeError, ValueError):
         return default
+    if math.isinf(number) or number > MAX_QUANTITY:
+        raise SecurityError('numeric_bounds', 'Числовой параметр превышает допустимый предел.')
     return default if math.isnan(number) or number < 0 else number
 
 
@@ -61,6 +65,7 @@ def sku_parameters(daily: pd.DataFrame, config: Config, catalog: pd.DataFrame | 
             if item['min_order_qty'] is None and 'min_order_qty' in info and pd.notna(info['min_order_qty']):
                 item['min_order_qty'] = info['min_order_qty']
         item['lead_time_days'] = int(round(_number(item['lead_time_days'], config.default_lead_time_days))) or config.default_lead_time_days
+        bounded_number(item['lead_time_days'], 'lead_time_days', 1, 275, integer=True)
         item['min_order_qty'] = _number(item['min_order_qty'], 0.)
         item['order_multiple'] = _number(item['order_multiple'], 1.) or 1.
         item['price'] = _number(item['price'])
@@ -207,8 +212,7 @@ def recommend_orders(daily: pd.DataFrame, future: pd.DataFrame, config: Config,
         need = demand + safety - available
         quantity = 0.
         if stock_known and need > 0:
-            quantity = math.ceil(need / p.order_multiple - 1e-9) * p.order_multiple
-            quantity = max(quantity, p.min_order_qty)
+            quantity = math.ceil(max(need, p.min_order_qty) / p.order_multiple - 1e-9) * p.order_multiple
         days_of_cover = available / daily_rate if daily_rate > 0 else float('inf')
         # Критично: запас закончится раньше, чем придёт поставка.
         if not stock_known:
@@ -300,7 +304,7 @@ def validate_approved_orders(orders: pd.DataFrame) -> pd.DataFrame:
     """Validate manual quantities before creating approval artifacts."""
     result = orders.copy()
     quantities = pd.to_numeric(result['approved_qty'], errors='coerce')
-    invalid = quantities.isna() | ~np.isfinite(quantities) | quantities.lt(0)
+    invalid = quantities.isna() | ~np.isfinite(quantities) | quantities.lt(0) | quantities.gt(MAX_QUANTITY)
     if invalid.any():
         skus = ', '.join(result.loc[invalid, 'sku'].astype(str).tolist())
         raise ValueError(f'Утверждённое количество должно быть неотрицательным числом: {skus}')
@@ -332,7 +336,7 @@ EXPORT_COLUMNS = {
 
 def to_1c_csv(table: pd.DataFrame) -> bytes:
     # Для 1С и русского Excel: разделитель «;», десятичная запятая, UTF-8 с BOM, целые без «.0».
-    table = table.copy()
+    table = spreadsheet_safe(table)
     for col in table.select_dtypes('number'):
         values = table[col]
         if values.dropna().eq(values.dropna().round()).all():
@@ -343,22 +347,19 @@ def to_1c_csv(table: pd.DataFrame) -> bytes:
 def export_orders(orders: pd.DataFrame, directory) -> dict:
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    readable = orders[list(EXPORT_COLUMNS)].rename(columns=EXPORT_COLUMNS)
+    readable = spreadsheet_safe(orders[list(EXPORT_COLUMNS)].rename(columns=EXPORT_COLUMNS))
     xlsx = directory / 'supplier_orders.xlsx'
     with pd.ExcelWriter(xlsx, engine='openpyxl') as writer:
-        supplier_summary(orders).rename(columns={
+        spreadsheet_safe(supplier_summary(orders).rename(columns={
             'supplier': 'Поставщик', 'positions': 'Позиций', 'total_qty': 'Количество',
-            'total_value': 'Сумма', 'critical_positions': 'Критичных'}).to_excel(writer, sheet_name='Сводка', index=False)
+            'total_value': 'Сумма', 'critical_positions': 'Критичных'})).to_excel(writer, sheet_name='Сводка', index=False)
         readable.to_excel(writer, sheet_name='Все позиции', index=False)
-        used = set()
+        used = {'сводка', 'все позиции'}
         for supplier, group in readable[readable['Рекомендуемое количество'] > 0].groupby('Поставщик'):
-            name = ''.join(c for c in str(supplier) if c not in '[]:*?/\\')[:31] or 'Поставщик'
-            while name in used:
-                name = name[:28] + f'_{len(used)}'
-            used.add(name)
+            name = safe_sheet_name(str(supplier), used)
             group.to_excel(writer, sheet_name=name, index=False)
     csv = directory / 'supplier_orders_1c.csv'
     csv.write_bytes(to_1c_csv(readable[readable['Рекомендуемое количество'] > 0]))
     full = directory / 'supplier_orders.csv'
-    orders.to_csv(full, index=False)
+    spreadsheet_safe(orders).to_csv(full, index=False)
     return {'xlsx': xlsx, 'csv_1c': csv, 'csv': full}

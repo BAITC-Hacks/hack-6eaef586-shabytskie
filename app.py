@@ -1,15 +1,13 @@
-import shutil
-import tempfile
-from datetime import datetime
-from io import BytesIO
+import logging
 from pathlib import Path
+import secrets
 import altair as alt
 import pandas as pd
 import streamlit as st
-from src.config import Config
-from src.ordering import (EXPORT_COLUMNS, STATUS_MISSING_STOCK, URGENCY_ORDER, to_1c_csv,
-                          validate_approved_orders)
-from src.pipeline import run_pipeline
+from src.ordering import EXPORT_COLUMNS, STATUS_MISSING_STOCK, URGENCY_ORDER
+from src.security import public_error, security_event
+from src.web_auth import require_principal, PERMISSIONS
+from src.web_service import WebService
 
 DEMO = Path('data/demo')
 URGENCY_COLORS = {'требуются данные': '⚫', 'критично': '🔴', 'высокая': '🟠',
@@ -27,70 +25,50 @@ INPUTS = {
 }
 
 st.set_page_config(page_title='Заказы поставщикам', page_icon='📦', layout='wide')
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+principal = require_principal()
 
 
-def demo_paths() -> dict:
-    if not (DEMO / 'synthetic_sales.csv').exists():
-        from src.generate_synthetic_data import generate
-        generate(DEMO / 'synthetic_sales.csv')
-    return {key: DEMO / file if file else None for key, (_, file, _) in INPUTS.items()}
-
-
-def save_uploads(uploads: dict, directory: Path) -> dict:
-    paths = {}
-    for key, upload in uploads.items():
-        if upload is None:
-            paths[key] = None
-            continue
-        path = directory / f'{key}{Path(upload.name).suffix.lower()}'
-        path.write_bytes(upload.getvalue())
-        paths[key] = path
-    return paths
-
-
-def calculate(paths: dict, config: Config, warehouse: str | None, category: str | None) -> None:
-    run_pipeline(paths['sales'], config, suppliers_path=paths['suppliers'], catalog_path=paths['catalog'],
-                 stock_path=paths['stock'], stockouts_path=paths['stockouts'], growth_path=paths['growth'],
-                 warehouse=warehouse, category=category)
-
-
-def session_config(root: Path, review: int = 7, z: float = 1.65) -> Config:
-    return Config(review_period_days=review, service_level_z=z, output_dir=root / 'outputs',
-                  processed_dir=root / 'processed', model_dir=root / 'models')
-
-
-# Результаты хранятся отдельно для каждой сессии браузера: в облаке файлы
-# одного пользователя не видны другому. Демо с параметрами по умолчанию
-# считается один раз на сервер и переиспользуется всеми сессиями.
 @st.cache_resource(show_spinner=False)
-def demo_result() -> Path:
-    root = Path(tempfile.mkdtemp(prefix='demo_orders_'))
-    calculate(demo_paths(), session_config(root), None, None)
-    return root
+def web_service() -> WebService:
+    # One bounded registry/limiter per process; private results are never cached globally.
+    return WebService(reap=True)
 
 
-def new_session_dir() -> Path:
-    if 'workdir' not in st.session_state:
-        st.session_state.workdir = Path(tempfile.mkdtemp(prefix='orders_'))
-    root = st.session_state.workdir
-    shutil.rmtree(root, ignore_errors=True)
-    root.mkdir(parents=True)
-    return root
+service = web_service()
+scope = (principal.subject, principal.role)
+if st.session_state.get('identity_scope') != scope:
+    st.session_state.clear()
+    st.session_state.identity_scope = scope
+st.session_state.setdefault('session_key', secrets.token_urlsafe(32))
+session_key = st.session_state.session_key
 
 
-@st.cache_data(show_spinner=False)
-def load_results(root: str, stamp: float) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    base = Path(root)
-    orders = pd.read_csv(base / 'outputs' / 'supplier_orders.csv', dtype={'sku': str})
-    daily = pd.read_csv(base / 'processed' / 'daily_demand.csv', parse_dates=['date'], dtype={'sku': str})
-    future = pd.read_csv(base / 'outputs' / 'daily_forecast.csv', parse_dates=['date'], dtype={'sku': str})
-    return orders, daily, future
+def calculate(demo: bool, uploads=None, review=7, z=1.65, warehouse=None, category=None):
+    token = service.calculate(principal, session_key, demo=demo, uploads=uploads,
+                              review=review, z=z, warehouse=warehouse, category=category)
+    old = st.session_state.get('result_token')
+    st.session_state.result_token = token
+    st.session_state.results_data = service.load_results(token, principal, session_key)
+    st.session_state.calculated_from = 'демо-данные' if demo else 'загруженные файлы'
+    st.session_state.pop('approved_file', None)
+    if old:
+        try:
+            service.discard(old, principal, session_key)
+        except ValueError:
+            security_event('workspace_already_expired', principal.subject)
 
 
-def to_excel(table: pd.DataFrame) -> bytes:
-    buffer = BytesIO()
-    table.to_excel(buffer, index=False)
-    return buffer.getvalue()
+with st.sidebar:
+    if principal.role != 'demo' and st.button('Выйти', key='logout'):
+        if st.session_state.get('result_token'):
+            try:
+                service.discard(st.session_state.result_token, principal, session_key)
+            except ValueError:
+                security_event('workspace_already_expired', principal.subject)
+        st.session_state.clear()
+        security_event('logout', principal.subject)
+        st.logout()
 
 
 def demand_chart(history: pd.DataFrame, forecast: pd.DataFrame) -> alt.LayerChart:
@@ -140,11 +118,13 @@ def demand_chart(history: pd.DataFrame, forecast: pd.DataFrame) -> alt.LayerChar
 
 with st.sidebar:
     st.header('Данные')
-    source = st.radio('Источник', ['Загрузить свои файлы', 'Демо-данные'], key='source')
+    sources = ['Загрузить свои файлы', 'Демо-данные'] if 'upload' in PERMISSIONS[principal.role] else ['Демо-данные']
+    source = st.radio('Источник', sources, key='source')
     uploads = {}
     if source == 'Загрузить свои файлы':
         for key, (label, _, columns) in INPUTS.items():
-            uploads[key] = st.file_uploader(label, type=['csv', 'xlsx'], help=f'Колонки: {columns}', key=f'upload_{key}')
+            uploads[key] = st.file_uploader(label, type=['csv', 'xlsx'], max_upload_size=20,
+                                            help=f'Колонки: {columns}. До 20 МБ, один лист XLSX без формул.', key=f'upload_{key}')
         with st.expander('Шаблоны файлов'):
             st.caption('Примеры в нужном формате — можно заполнить своими данными.')
             for key, (label, file, _) in INPUTS.items():
@@ -156,8 +136,8 @@ with st.sidebar:
         st.caption('Синтетика: 20 артикулов, 400 дней, 4 поставщика, разовые заказы и периоды дефицита.')
 
     st.header('Параметры')
-    warehouse = st.text_input('Склад (пусто = все)', '').strip() or None
-    category = st.text_input('Категория (пусто = все)', '').strip() or None
+    warehouse = st.text_input('Склад (пусто = все)', '', max_chars=128).strip() or None
+    category = st.text_input('Категория (пусто = все)', '', max_chars=128).strip() or None
     review = int(st.number_input('Период пересмотра, дн.', 1, 90, 7))
     z = float(st.number_input('z уровня сервиса', 0., 4., 1.65, .05, help='1.65 ≈ 95% уровень сервиса'))
 
@@ -165,34 +145,35 @@ with st.sidebar:
     if st.button('Запустить расчёт', type='primary', disabled=not ready, key='run', width='stretch'):
         with st.spinner('Расчёт… до минуты'):
             try:
-                if source == 'Демо-данные' and (warehouse, category, review, z) == (None, None, 7, 1.65):
-                    st.session_state.result_dir = demo_result()
-                else:
-                    root = new_session_dir()
-                    with tempfile.TemporaryDirectory() as directory:
-                        paths = demo_paths() if source == 'Демо-данные' else save_uploads(uploads, Path(directory))
-                        calculate(paths, session_config(root, review, z), warehouse, category)
-                    st.session_state.result_dir = root
-                st.session_state.calculated_from = 'демо-данные' if source == 'Демо-данные' else uploads['sales'].name
-                st.session_state.pop('approved_file', None)
-            except (ValueError, OSError) as exc:
-                st.error(str(exc))
+                calculate(source == 'Демо-данные', uploads, review, z, warehouse, category)
+            except Exception as exc:
+                st.error(public_error(exc, principal.subject))
     if not ready:
         st.caption('Загрузите историю продаж, чтобы запустить расчёт.')
 
 st.title('Рекомендованные заказы поставщикам')
 
-if 'result_dir' not in st.session_state:
+if 'result_token' not in st.session_state:
     st.markdown('Загрузите выгрузку продаж в боковой панели или посмотрите, как работает сервис, на демо-данных.')
     if st.button('Показать на демо-данных', type='primary', key='demo_start'):
         with st.spinner('Расчёт на демо-данных… до минуты'):
-            st.session_state.result_dir = demo_result()
-            st.session_state.calculated_from = 'демо-данные'
+            try:
+                calculate(True)
+            except Exception as exc:
+                st.error(public_error(exc, principal.subject))
+                st.stop()
         st.rerun()
     st.stop()
 
-result_dir = st.session_state.result_dir
-orders, daily, future = load_results(str(result_dir), (result_dir / 'outputs' / 'supplier_orders.csv').stat().st_mtime)
+result_token = st.session_state.result_token
+try:
+    service.resolve(result_token, principal, session_key)
+except Exception as exc:
+    for key in ['result_token', 'results_data', 'approved_file']:
+        st.session_state.pop(key, None)
+    st.error(public_error(exc, principal.subject))
+    st.stop()
+orders, daily, future = st.session_state.results_data
 st.caption(f"Расчёт по: {st.session_state.get('calculated_from', '—')}. Заказ — черновик, поставщику ничего не отправляется.")
 
 active = orders[orders.recommended_qty > 0]
@@ -219,38 +200,28 @@ with tab_orders:
         view[shown].rename(columns=EXPORT_COLUMNS | {'urgency': 'Срочность'}),
         disabled=[EXPORT_COLUMNS.get(c, c) for c in shown if c != 'approved_qty'],
         column_config={'Обоснование': st.column_config.TextColumn(width='large')},
-        hide_index=True, width='stretch', key=f'editor_{supplier}')
-    approver = st.text_input('Ответственный', '', key='approver')
-    if st.button(f'Утвердить заказ: {supplier}', disabled=not approver.strip(), key='approve'):
+        hide_index=True, width='stretch', key=f'editor_{result_token}_{supplier}')
+    can_approve = bool({'approve', 'approve_demo'} & PERMISSIONS[principal.role])
+    st.caption('Ответственный определяется учётной записью; в демо утверждение учебное.')
+    if st.button('Утвердить заказ выбранному поставщику', disabled=not can_approve, key='approve'):
         try:
-            approved = view.copy()
-            approved['approved_qty'] = edited['Утверждённое количество'].to_numpy()
-            blocked_untouched = approved.status.eq(STATUS_MISSING_STOCK) & approved.approved_qty.isna()
-            approved.loc[blocked_untouched, 'approved_qty'] = 0.
-            approved = validate_approved_orders(approved)
-            approved = approved[approved.approved_qty > 0]
-            if approved.empty:
-                raise ValueError('Нет позиций с количеством больше 0: утверждать нечего.')
-            approved['urgency'] = approved.urgency.str.split(' ', n=1).str[-1]
-            approved['order_value'] = approved.approved_qty * approved.price
-            approved_at = datetime.now()
-            approved['status'] = f'утверждён: {approver.strip()} {approved_at:%Y-%m-%d %H:%M:%S}'
-            table = approved[list(EXPORT_COLUMNS)].rename(columns=EXPORT_COLUMNS)
-            stem = f"{''.join(c if c.isalnum() else '_' for c in supplier)}_{approved_at:%Y%m%d_%H%M%S}"
-            # Утверждение только готовит файлы для ответственного — поставщику заказ автоматически не отправляется.
-            st.session_state.approved_file = (stem, to_excel(table), to_1c_csv(table))
-        except ValueError as exc:
+            edits = edited[['Артикул', 'Утверждённое количество']].rename(
+                columns={'Артикул': 'sku', 'Утверждённое количество': 'approved_qty'})
+            st.session_state.approved_file = service.approve(result_token, principal, session_key, supplier, edits)
+        except Exception as exc:
             st.session_state.pop('approved_file', None)
-            st.error(str(exc))
+            st.error(public_error(exc, principal.subject))
     if 'approved_file' in st.session_state:
         stem, xlsx_bytes, csv_bytes = st.session_state.approved_file
         st.success(f'Заказ утверждён: {stem}. Скачайте файл и передайте поставщику.')
         left, right = st.columns(2)
         left.download_button('Утверждённый заказ (XLSX)', xlsx_bytes, f'{stem}.xlsx', key='dl_approved_xlsx')
         right.download_button('Утверждённый заказ для 1С (CSV)', csv_bytes, f'{stem}_1c.csv', key='dl_approved_csv')
-    all_xlsx = result_dir / 'outputs' / 'supplier_orders.xlsx'
-    if all_xlsx.exists():
-        st.download_button('Скачать все заказы (XLSX)', all_xlsx.read_bytes(), 'supplier_orders.xlsx', key='dl_all')
+    try:
+        all_xlsx = service.download(result_token, principal, session_key)
+        st.download_button('Скачать все заказы (XLSX)', all_xlsx, 'supplier_orders.xlsx', key='dl_all')
+    except Exception as exc:
+        st.error(public_error(exc, principal.subject))
 
 with tab_card:
     ranked = orders.assign(_rank=orders.urgency.map(URGENCY_ORDER)).sort_values(['_rank', 'days_of_cover'])

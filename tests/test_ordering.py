@@ -299,7 +299,7 @@ class MustHave5SupplierListWithReasons(unittest.TestCase):
 
             audit = pd.read_csv(root / 'p' / 'transactions_audit.csv')
             self.assertFalse(audit.client_id.isin(['C1']).any())
-            self.assertTrue(audit.client_id.str.match(r'^C[0-9a-f]{12}$').all())
+            self.assertTrue(audit.client_id.str.match(r'^C[0-9a-f]{32}$').all())
 
             with self.assertRaisesRegex(ValueError, 'Склад'):
                 stock_path = root / 'stock.csv'

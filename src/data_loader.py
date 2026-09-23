@@ -2,6 +2,8 @@ import logging
 from pathlib import Path
 import pandas as pd
 from src.config import ALIASES, REQUIRED
+from src.secure_files import read_bounded_table
+from src.security import MAX_QUANTITY, SecurityError
 
 SALES_OPTIONAL = {'client_id', 'product_name', 'price', 'warehouse', 'stock', 'stockout_flag',
                   'supplier', 'lead_time_days', 'in_transit', 'category'}
@@ -22,16 +24,14 @@ def map_columns(frame: pd.DataFrame, required: set[str] = REQUIRED,
     absent = (optional or set()) - set(renamed)
     if absent:
         logging.warning('Missing optional fields: %s', ', '.join(sorted(absent)))
+    # Unknown export columns may contain names, phones or emails. They are not
+    # needed by this module and must not flow into audit files or the browser.
+    result = result[[col for col in result if col in ALIASES or col == 'transaction_id']]
     return result
 
 
 def read_table(path: str | Path) -> pd.DataFrame:
-    path = Path(path)
-    if path.suffix.lower() == '.csv':
-        return pd.read_csv(path, dtype=str, sep=None, engine='python', encoding='utf-8-sig')
-    if path.suffix.lower() == '.xlsx':
-        return pd.read_excel(path, dtype=str)
-    raise ValueError(f'{path.name}: input must be CSV or XLSX')
+    return read_bounded_table(path)
 
 
 def load_data(path: str | Path) -> pd.DataFrame:
@@ -47,4 +47,19 @@ def load_reference(path: str | Path | None, required: set[str]) -> pd.DataFrame 
     for col in ['sku', 'supplier', 'category', 'warehouse']:
         if col in frame:
             frame[col] = frame[col].astype('string').str.strip()
+    for col in required:
+        if frame[col].isna().any() or frame[col].astype('string').str.strip().eq('').any():
+            raise SecurityError('reference_required', f'Обязательное поле {col} не заполнено.')
+    # Bound numerical references before model training or date-range allocation.
+    from src.preprocessing import parse_numbers
+    for col in ['stock', 'in_transit', 'price', 'lead_time_days', 'min_order_qty', 'order_multiple']:
+        if col not in frame:
+            continue
+        numbers = parse_numbers(frame[col])
+        maximum = 275 if col == 'lead_time_days' else MAX_QUANTITY
+        minimum = 1 if col in {'lead_time_days', 'order_multiple'} else 0
+        invalid = frame[col].notna() & (numbers.isna() | numbers.lt(minimum) | numbers.gt(maximum))
+        if invalid.any():
+            raise SecurityError('reference_numeric', f'Недопустимые значения поля {col}.')
+        frame[col] = numbers
     return frame
