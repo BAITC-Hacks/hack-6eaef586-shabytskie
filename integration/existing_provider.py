@@ -68,6 +68,8 @@ def forecast(data: InputBundle, settings: AnalysisSettings) -> ForecastBundle:
         "estimated_lost_demand": "lost_demand", "seasonality_detected": "is_seasonal",
         "large_client_orders_detected": "anomalies_removed"})
     history = daily.rename(columns={"quantity": "actual_sales", "stockout_flag": "is_stockout"})
+    anomaly_flags = [c for c in ["is_outlier", "is_large_client_order"] if c in history]
+    history["is_anomaly"] = history[anomaly_flags].fillna(False).any(axis=1) if anomaly_flags else False
     daily_forecast = future.rename(columns={"prediction": "predicted_demand"})
     quality = pd.DataFrame([{"check": key, "value": str(value)} for key, value in report.items()])
     return ForecastBundle(normalized, daily_forecast, history, quality,
