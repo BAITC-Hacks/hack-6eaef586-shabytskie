@@ -1,11 +1,9 @@
-"""Transaction cleaning and dense SKU daily aggregation."""
 import logging
 import numpy as np
 import pandas as pd
 
 
 def clean_transactions(frame: pd.DataFrame) -> pd.DataFrame:
-    """Remove exact duplicates; reject invalid targets instead of fabricating demand."""
     frame = frame.drop_duplicates().copy()
     frame['date'] = pd.to_datetime(frame['date'], errors='coerce', format='mixed').dt.normalize()
     frame['sku'] = frame['sku'].astype('string').str.strip().replace('', pd.NA)
@@ -34,11 +32,6 @@ def clean_transactions(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def aggregate_daily(frame: pd.DataFrame) -> pd.DataFrame:
-    """Sum demand, deduplicate warehouse snapshots, and retain explicit zero days.
-
-    Missing calendar days imply zero recorded sales but unknown stock. Inventory
-    snapshots are never carried forward to infer historical stockouts.
-    """
     keys = ['sku', 'date']
     grouped = frame.groupby(keys, sort=True)
     daily = grouped.agg(quantity=('quantity', 'sum'), quantity_clean=('quantity_clean', 'sum'),

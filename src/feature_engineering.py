@@ -1,4 +1,3 @@
-"""Calendar and strictly shifted demand features."""
 import numpy as np
 import pandas as pd
 
@@ -10,7 +9,7 @@ FEATURES = ['sku'] + NUMERIC_FEATURES
 
 
 def feature_row(sku: str, date: pd.Timestamp, history: list[float]) -> dict:
-    """Shared training/inference feature calculation; history excludes target day."""
+    # history содержит только дни до целевого — будущие данные в признаки не попадают.
     h = np.asarray(history, dtype=float)
     row = dict(sku=str(sku), day_of_week=date.dayofweek, week_of_year=int(date.isocalendar().week),
                month=date.month, quarter=date.quarter, day_of_month=date.day,
@@ -29,7 +28,6 @@ def feature_row(sku: str, date: pd.Timestamp, history: list[float]) -> dict:
 
 
 def engineer_features(daily: pd.DataFrame) -> pd.DataFrame:
-    """Construct each row from prior targets only (equivalent to shift(1))."""
     rows = []
     for sku, group in daily.groupby('sku', sort=False):
         history = []
@@ -41,7 +39,6 @@ def engineer_features(daily: pd.DataFrame) -> pd.DataFrame:
 
 
 def seasonality(history: pd.DataFrame) -> tuple[bool, float]:
-    """Weekly autocorrelation after removing a local trend; descriptive, not proof."""
     values = history.adjusted_demand
     if len(values) < 56:
         return False, 0.

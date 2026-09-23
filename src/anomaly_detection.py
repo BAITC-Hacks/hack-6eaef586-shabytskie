@@ -1,21 +1,14 @@
-"""Past-only, auditable client-order and SKU IQR anomaly handling."""
 import numpy as np
 import pandas as pd
 
 
 def historical_bounds(values: pd.Series, window: int = 90) -> pd.Series:
-    """IQR bounds from prior observations; warm-up requires seven samples."""
     past = values.shift(1).rolling(window, min_periods=7)
     q1, q3 = past.quantile(.25), past.quantile(.75)
     return q3 + 1.5 * (q3 - q1)
 
 
 def detect_client_orders(frame: pd.DataFrame) -> pd.DataFrame:
-    """Cap client/day/SKU totals against prior SKU client-order distributions.
-
-    All clients on a date share the same historical threshold. Anonymous rows
-    are retained but cannot be classified as single-client anomalies.
-    """
     result = frame.copy()
     result['quantity_clean'] = result['quantity']
     result['is_large_client_order'] = False
@@ -31,10 +24,12 @@ def detect_client_orders(frame: pd.DataFrame) -> pd.DataFrame:
                 past = np.asarray(history[-500:])
                 q1, median, q3 = np.quantile(past, [.25, .5, .75])
                 mad = np.median(np.abs(past - median))
+                # Порог по прошлым заказам клиентов; заказ выше порога считается разовым,
+                # и его объём заменяется медианным обычным заказом.
                 bound = max(q3 + 3 * (q3 - q1), median + 6 * 1.4826 * mad, 3 * median, 1.)
                 for row in day.itertuples():
                     if row.quantity > bound:
-                        caps[(sku, date, row.client_id)] = bound / row.quantity
+                        caps[(sku, date, row.client_id)] = median / row.quantity
             history.extend(day.quantity.tolist())
     seen = set()
     for idx, row in result.iterrows():
@@ -48,7 +43,7 @@ def detect_client_orders(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def detect_daily_outliers(daily: pd.DataFrame) -> pd.DataFrame:
-    """Cap cleaned daily demand using strictly earlier non-stockout days."""
+    # Дневной спрос ограничивается Q3 + 1.5·IQR за предыдущие 90 дней без дефицита.
     result = daily.copy()
     eligible = result.quantity_clean.where(~result.stockout_flag)
     bounds = eligible.groupby(result.sku).transform(historical_bounds)

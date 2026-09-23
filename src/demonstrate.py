@@ -1,4 +1,3 @@
-"""Quantitative synthetic checks; run after the main synthetic pipeline."""
 import json
 from pathlib import Path
 import joblib
@@ -12,7 +11,6 @@ from src.pipeline import prepare
 
 
 def main() -> None:
-    """Report controlled calendar/growth sensitivity and bulk-order robustness."""
     raw = load_data('data/raw/synthetic_sales.csv')
     _, daily = prepare(raw)
     bundle = joblib.load('models/demand_model.joblib')
@@ -21,13 +19,10 @@ def main() -> None:
     history = group.adjusted_demand.tolist()
     date = group.date.max() + pd.Timedelta(days=1)
     base = feature_row('SKU001', date, history)
-    # All other variables fixed: isolate the calendar/growth feature responses.
     weekday_rows = [dict(base, day_of_week=day) for day in range(7)]
     growth_rows = [dict(base, growth_rate=rate) for rate in [-.3, .3]]
     weekdays = model.predict(pd.DataFrame(weekday_rows)[FEATURES])
     growth = model.predict(pd.DataFrame(growth_rows)[FEATURES])
-    # Inject an additional order close to forecast origin; hold the fitted model
-    # fixed to isolate preprocessing + recursive forecasting sensitivity.
     modified = raw.copy()
     idx = modified[(modified.sku == 'SKU001') & (modified.date == modified.date.max())].index[0]
     modified.loc[idx, 'quantity'] = str(float(modified.loc[idx, 'quantity']) + 1000)

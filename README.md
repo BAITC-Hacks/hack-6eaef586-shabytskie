@@ -1,122 +1,176 @@
-# Электрокомплект: demand forecasting MVP
+# Электрокомплект: автоматический расчёт заказов поставщикам
 
-Manual procurement planning risks overstock and stockouts. This module cleans sales history, caps unusual bulk purchases, estimates stockout losses, and forecasts regular SKU demand. It **does not calculate supplier order quantities**.
+Сервис строит по истории продаж рекомендованные заказы поставщикам. Для каждого артикула он выдаёт количество, срочность и обоснование, а весь список группирует по поставщикам. При расчёте учитываются сезонность, устойчивый рост, текущие остатки, товары в пути, категории, плановый прирост и упущенный спрос в периоды отсутствия товара. Разовые крупные заказы, включая крупные продажи одному клиенту, из регулярной потребности исключаются.
 
-## Run
+Менеджер отдела закупа запускает расчёт по складу или категории, получает список по поставщикам, при необходимости правит количество и утверждает заказ. **Автоматически поставщику ничего не отправляется**: утверждение только сохраняет файлы для ответственного сотрудника.
 
-Python 3.11+ is required. From the project root:
+## Запуск
+
+Нужен Python 3.11+.
 
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# быстрый старт: без аргументов считает на демо-данных из data/raw (создаёт их при необходимости)
+python main.py
+
+# синтетические данные + справочники (data/raw/*.csv)
 python -m src.generate_synthetic_data
-python main.py --input data/raw/synthetic_sales.csv --forecast-days 30 --chart-sku SKU001
-python main.py --input data/raw/sales.xlsx --forecast-days 14
+
+# полный расчёт
+python main.py --input data/raw/synthetic_sales.csv \
+  --suppliers data/raw/suppliers.csv --catalog data/raw/catalog.csv \
+  --stockouts data/raw/stockouts.csv --growth data/raw/category_growth.csv \
+  --chart-sku SKU001
+
+# только один склад / одна категория
+python main.py --input data/raw/synthetic_sales.csv --warehouse WH1
+python main.py --input data/raw/synthetic_sales.csv --category "Категория 1"
+
+# дашборд: просмотр по поставщикам, корректировка, утверждение, выгрузка
+streamlit run app.py
+
+# тесты
 python -m unittest discover -s tests -v
-python -m src.demonstrate
 ```
 
-The synthetic example has 20 SKUs, 400 days, 16,000 rows, weekly and annual cycles, growing/declining products, stockouts, 350-unit client orders, four suppliers, categories, stock and transit snapshots. Its two `synthetic_*` columns are audit truth and are never model inputs. The demonstration writes controlled calendar/growth feature sensitivity and a recent 1,000-unit order perturbation to `outputs/synthetic_checks.json`.
+Параметры политики запасов: `--review-days` (период пересмотра, по умолчанию 7), `--service-z` (z уровня сервиса, 1.65 ≈ 95%), `--default-lead-time` (срок поставки, если он не указан, 14). `--forecast-days` задаёт горизонт отчёта прогноза. Горизонт прогноза для заказа выбирается автоматически и покрывает самый длинный срок поставки плюс период пересмотра.
 
-Optional `--cv-splits 3` uses expanding chronological folds. `--output-dir PATH` changes report/forecast location; audits and fitted models retain their standard locations. Horizon accepts any positive integer, including 7, 14, 30 and 60. Horizon begins after the latest input date, not the computer's current date.
+## Входные данные
 
-## Architecture
+Все файлы принимаются в CSV (любой разделитель) или XLSX. Названия колонок распознаются на русском и английском, регистр не важен. Если две колонки подходят под одно поле, файл отклоняется.
+
+| Файл | Обязательные поля | Необязательные |
+|---|---|---|
+| `--input` история продаж | Дата, Артикул, Количество | ID клиента (обезличенный), Наименование, Цена, Склад, Остаток на дату, Нет в наличии, Поставщик, Категория, Срок поставки, В пути |
+| `--suppliers` справочник поставщиков | Поставщик | Срок поставки, Минимальная партия |
+| `--catalog` номенклатура / выгрузка из 1С | Артикул | Наименование, Категория, Поставщик, Срок поставки, Мин. партия, Кратность |
+| `--stock` текущие остатки | Артикул, Остаток | Склад, В пути (суммируются по складам) |
+| `--stockouts` периоды отсутствия | Артикул, Дата начала | Дата окончания (пусто = по последнюю дату) |
+| `--growth` прогноз прироста | Прирост + Категория или Артикул | `10%`, `0,1` и `0.1` значат одно и то же; строка по артикулу важнее строки по категории |
+
+Приоритет источников для параметров товара: номенклатура → справочник поставщиков → поля из выгрузки продаж → значения по умолчанию. Остатки из `--stock` имеют приоритет над остатками из продаж. Если на последнюю дату зафиксировано отсутствие товара, старый положительный остаток не используется.
+
+Приватность: сервис работает только с обезличенным ID клиента и нужен ему лишь для поиска разовых заказов. В выходные файлы ID клиента не попадает.
+
+## Методология
+
+### 1. Очистка и агрегация
+Некорректные даты, пустые артикулы и отрицательные количества (возвраты) отбрасываются, число отброшенных строк пишется в лог. Точные дубликаты удаляются. Продажи агрегируются по дням. Дни без продаж заполняются нулями от первой продажи артикула до последней даты выгрузки. Остатки берутся как последний снимок на дату по каждому складу и затем суммируются по складам.
+
+### 2. Исключение разовых крупных заказов и выбросов
+Используются **только прошлые данные**, поэтому нет утечки будущего.
+
+1. **Крупный заказ одного клиента.** Считается суммарное количество клиента по артикулу за день. Оно сравнивается с распределением прежних заказов этого артикула. Порог: `max(Q3 + 3·IQR, медиана + 6·1.4826·MAD, 3·медиана)`, проверка начинается после 7 наблюдений. Если заказ выше порога, он заменяется медианным обычным заказом: разовая часть исключается из спроса, обычная потребность клиента сохраняется.
+2. **Дневной выброс по артикулу.** Если спрос за день больше `Q3 + 1.5·IQR` за предыдущие 90 дней без дефицита, он ограничивается этой границей. Этот шаг ловит крупные заказы без ID клиента.
+
+Исходное количество остаётся в аудите (`data/processed/transactions_audit.csv`, `daily_demand.csv`), а в обоснование пишется, сколько единиц исключено.
+
+### 3. Упущенный спрос (stockout)
+День считается днём дефицита, если в продажах стоит флаг «Нет в наличии», если суммарный остаток равен 0 или если день попадает в период из `--stockouts`. Ожидаемый спрос в такой день равен медиане предыдущих 14 надёжных дней (без дефицита и аномалий); если таких дней нет, берётся медиана всей прошлой истории. Упущенный спрос = `max(ожидаемый − продано, 0)`. Скорректированный спрос = продажи + упущенный спрос.
+
+### 4. Прогноз спроса
+Используется одна общая модель RandomForest на все артикулы (100 деревьев, seed 42). Признаки: календарь (день недели, неделя, месяц, годовые sin/cos), лаги 1/7/14/28, скользящие средние, медианы и стандартные отклонения, темп роста. Все признаки строятся по данным до целевого дня. Прогноз рекурсивный. Для каждого артикула модель выбирается, только если на валидации она лучше базовой 7-дневной средней, иначе используется базовая средняя.
+
+### 5. Расчёт заказа (`src/ordering.py`)
+Используется политика «пополнение до уровня»:
+
+```
+покрытие   = срок поставки + период пересмотра
+спрос      = Σ прогноз модели за покрытие × годовая сезонность × устойчивый тренд × (1 + плановый прирост)
+страховой  = z × σ ошибки прогноза × √покрытие     (σ ≈ 1.25·MAE на валидации, иначе σ спроса за 90 дн.)
+потребность = спрос + страховой − (остаток + в пути)
+заказ      = потребность, округлённая вверх до кратности, не меньше минимальной партии
+```
+
+- **Годовая сезонность.** Берётся спрос прошлого года в том же окне и делится на спрос прошлого года за 28 дней до этого окна. Сдвиг ровно на 52 недели сохраняет дни недели. Множитель ограничен диапазоном [0.5; 2]. Применяется, если история длиннее года.
+- **Устойчивый тренд.** Если история длиннее года, тренд считается как рост последних 28 дней к тем же дням прошлого года, поэтому сезонность на него не влияет. Если история короче, нужны два подряд месячных изменения одного знака, каждое больше 3%. Тренд продлевается на половину периода покрытия, множитель ограничен диапазоном [0.8; 1.25]. Случайные колебания трендом не считаются.
+- **Недельная сезонность** учитывается самой моделью через признак дня недели и лаг 7.
+- **Срочность:** `критично`, если запаса хватит меньше, чем на срок поставки; `высокая`, если меньше, чем на покрытие; `плановая` для остальных заказов; `не требуется`, если заказывать не нужно. Внутри поставщика позиции отсортированы по срочности и запасу в днях.
+- **Обоснование** на русском содержит все числа, из которых получилось количество, а также размер поправки на упущенный спрос и исключённых разовых заказов. Поле `raw_sales_need` показывает для сравнения, какой была бы потребность по «сырым» продажам.
+
+## Результаты
+
+| Файл | Содержание |
+|---|---|
+| `outputs/supplier_orders.xlsx` | Лист «Сводка» по поставщикам, лист «Все позиции» и отдельный лист на каждого поставщика |
+| `outputs/supplier_orders_1c.csv` | Позиции к заказу для импорта в 1С/Excel: разделитель `;`, UTF-8 BOM, русские заголовки |
+| `outputs/supplier_orders.csv` | Все поля расчёта (множители, запасы, сравнение с «сырыми» продажами) |
+| `outputs/approved/*.xlsx, *_1c.csv` | Утверждённые в дашборде заказы с ФИО ответственного и временем утверждения |
+| `outputs/forecast_output.csv`, `daily_forecast.csv` | Прогноз спроса по артикулам и по дням |
+| `outputs/metrics.json`, `validation_predictions.csv` | Качество прогноза на отложенном периоде |
+| `data/processed/*.csv` | Аудит: исходное и очищенное количество, флаги аномалий и дефицита |
+
+Колонки заказа: Поставщик, Артикул, Наименование, Категория, Рекомендуемое количество, Утверждённое количество (редактируется), Срочность, Запас (дн.), Срок поставки, Спрос на период, Страховой запас, Остаток, В пути, Цена, Сумма, Обоснование, Статус (`черновик — требует утверждения`).
+
+## Тесты и соответствие требованиям кейса
+
+В `tests/test_ordering.py` каждая проверка из раздела Must have оформлена отдельным тестом. В `tests/test_pipeline.py` проверяются очистка данных, отсутствие утечки будущего и форматы входных файлов. Всего 32 теста.
+
+| Must have | Проверка из ТЗ | Тест |
+|---|---|---|
+| 1. Учитываются все источники | Изменение остатка, товаров в пути, истории, срока поставки (из справочника), прироста категории, кратности или минимальной партии меняет итоговое количество | `MustHave1AllSourcesAffectResult` (9 тестов с точными ожидаемыми значениями) |
+| 2. Сезонность и рост | Для товара с летним пиком заказ больше, чем при расчёте по средней за всю историю (×1.4+). Прогноз модели повторяет недельный цикл (выходные > 3× будни). Устойчивый рост продлевается, случайный шум трендом не считается | `MustHave2SeasonalityAndGrowth` |
+| 3. Упущенный спрос | Заказ по артикулу с дефицитом больше, чем расчёт по «сырым» продажам. Периоды из отдельной таблицы stockout тоже учитываются | `MustHave3LostDemand` |
+| 4. Разовые крупные заказы | Добавленный заказ клиента на 1000 ед. меняет рекомендуемое количество не больше чем на 5%, хотя без исключения потребность выросла бы в 3+ раза. Крупный заказ без ID клиента тоже отсекается | `MustHave4OneOffOrders` |
+| 5. Список по поставщикам с обоснованием | Сквозной запуск: позиции сгруппированы по поставщикам, в каждой строке есть обоснование с итоговым количеством, в XLSX есть лист на поставщика, CSV для 1С открывается, фильтр по категории работает, статус «требует утверждения» | `MustHave5SupplierListWithReasons` |
+
+Тесты проверялись на поломках: если отключить учёт товаров в пути, коррекцию stockout, исключение крупных заказов или сезонные множители, соответствующие тесты падают.
+
+Опциональные пункты кейса: приоритизация по риску дефицита (срочность и запас в днях), минимальная партия и кратность, графики трендов по категориям (вкладка в дашборде), выгрузка заказа поставщику в виде файла после ручного утверждения.
+
+## Проверка на синтетических данных
+
+Синтетика: 20 артикулов, 400 дней, недельный и годовой циклы, растущие и падающие товары, 4 поставщика со сроками 7–28 дней, запас от 5 до 60 дней. Недавние аномалии: у SKU003 разовый заказ на 600 ед. за 5 дней до конца истории, у SKU005 дефицит последние 5 дней (есть флаг в продажах), у SKU010 дефицит последние 4 дня (известен только из `stockouts.csv`).
+
+| Артикул | Ситуация | Расчёт по «сырым» продажам | Рекомендация |
+|---|---|---:|---:|
+| SKU003 | разовый заказ 600 ед. | 798 | 190 |
+| SKU005 | дефицит, флаг в продажах | 199 | 230 (критично) |
+| SKU010 | дефицит из отдельной таблицы, 90 ед. в пути | 1001 | 1783 (критично) |
+
+Итого: 11 позиций «критично», 3 «высокая», 6 «не требуется».
+
+Качество прогноза на отложенных 20% дат (1 567 надёжных SKU-дней, 33 дня с дефицитом или аномалией исключены):
+
+| Модель | MAE | RMSE | MAPE |
+|---|---:|---:|---:|
+| Рекурсивная 7-дневная средняя | 8.33 | 11.53 | 29.9% |
+| RandomForest | 5.56 | 7.58 | 20.5% |
+
+`python -m src.demonstrate`: заказ на 1000 ед. за последний день меняет 30-дневный прогноз SKU001 на −0.24%. Это синтетические данные, а не оценка точности на реальных данных компании.
+
+## Архитектура
 
 ```text
-main.py
-requirements.txt
+main.py                       # CLI
+app.py                        # Streamlit: расчёт, просмотр, корректировка, утверждение
 src/
-  config.py                    # aliases, reproducible settings
-  data_loader.py               # CSV/XLSX, mapping and validation
-  preprocessing.py             # cleaning, daily aggregation
-  anomaly_detection.py         # client caps, historical SKU IQR
-  stockout.py                  # historical lost-demand estimates
-  feature_engineering.py       # lag, rolling, calendar, growth
-  forecasting.py               # estimator factory and recursive forecast
-  evaluation.py                # date splits, baseline, MAE/RMSE/MAPE
-  pipeline.py                  # orchestration, exports, charts
-  generate_synthetic_data.py
-  demonstrate.py
-  __init__.py
-data/raw/
-data/processed/
-models/
-outputs/charts/
-tests/test_pipeline.py
+  config.py                   # синонимы колонок, параметры политики запасов
+  data_loader.py              # CSV/XLSX, сопоставление колонок, справочники
+  preprocessing.py            # очистка, дневная агрегация, остатки по складам
+  anomaly_detection.py        # разовые заказы клиентов, дневные выбросы (IQR/MAD)
+  stockout.py                 # периоды отсутствия, упущенный спрос
+  feature_engineering.py      # лаги, скользящие, календарь, рост
+  forecasting.py              # модель и рекурсивный прогноз
+  evaluation.py               # хронологическая валидация, MAE/RMSE/MAPE
+  ordering.py                 # расчёт заказа, срочность, обоснование, экспорт
+  pipeline.py                 # оркестрация
+  generate_synthetic_data.py  # синтетика + справочники
+  demonstrate.py              # проверки чувствительности
+tests/
+  test_ordering.py            # приёмочные тесты по Must have
+  test_pipeline.py            # очистка, утечки, форматы
 ```
 
-## Input contract
+## Допущения и ограничения
 
-One row is a sales transaction or a dated stock snapshot with quantity zero. Required fields are `date`, `sku`, `quantity`; missing fields produce a clear error. Use ISO dates (YYYY-MM-DD) for unambiguous parsing. Identifiers are read as text; Excel numeric cells cannot preserve leading zeroes that exist only in cell formatting.
-
-| Canonical field | Accepted examples | Status |
-|---|---|---|
-| date | sale_date, Дата, Дата продажи | required |
-| sku | article, product_id, Артикул, Код товара | required |
-| quantity | qty, Количество, Продажи | required |
-| client_id | customer_id, Клиент, ID клиента | optional; enables client detection |
-| product_name | name, Наименование, Название товара | optional |
-| stock | inventory, current_stock, Остаток, Остаток на дату | optional dated inventory |
-| stockout_flag | stockout, Нет в наличии | optional explicit indicator |
-| price / warehouse | Цена / Склад | optional |
-| supplier / category | Поставщик / Категория | optional |
-| lead_time_days | lead_time, Срок поставки | optional |
-| in_transit | Товар в пути, В пути | optional |
-
-Mapping ignores case/outer spaces; conflicting aliases are rejected. Unknown extra columns remain in the transaction audit but are excluded from model inputs. Missing optional fields are logged. Invalid dates, missing identifiers, invalid quantities and negative returns are dropped with a count. Negative/invalid optional numeric values become missing. Exact duplicate rows are removed; provide a transaction ID to distinguish otherwise identical legitimate transactions. Product metadata carries forward only. Stockouts accept true/false, 1/0, yes/no, да/нет.
-
-## Methodology
-
-1. Aggregate each client's SKU purchases per date. Compare against **earlier dates'** SKU client-order distribution using IQR and median absolute deviation; after seven samples, cap extreme totals and proportionally allocate the cap to transactions. Record raw and cleaned quantities and count orders once.
-2. Aggregate daily demand, retain zero days, and fill missing calendar days from each SKU's first observation to the global latest date. Compute each warehouse's last inventory snapshot per date and sum warehouses, avoiding repeated transaction-level stock counts. A positive explicit stockout flag or total stock zero marks the SKU-day.
-3. Cap daily demand at prior 90-calendar-day Q3 + 1.5×IQR, with at least seven non-stockout observations. Anomaly corrections use only previous data and preserve raw quantity.
-4. Estimate stockout demand from the prior 14 calendar days' median, excluding stockout and anomalous days. Fall back to expanding historical median. Lost demand is max(expected − cleaned sales, 0). Cold starts without reliable history have zero estimated loss and `stockout_estimate_available=False`.
-5. Calendar features include weekday, ISO week, month, quarter, day of month and annual sine/cosine. Lags are 1/7/14/28; rolling means 7/14/30, median 7, standard deviations 7/30. Each feature uses history ending **before** its target day, equivalent to `shift(1)`. Growth compares the latest 30 days with the prior available period, requires more than 30 days, and is clipped to [-1, 10]. Weekly seasonality is a descriptive detrended lag-7 correlation; detection threshold 0.3 after 56 days.
-6. Train one global RandomForest (100 trees, seed 42) with sparse one-hot SKU encoding and numeric imputation. Replacing `train_model` with an estimator exposing `predict` keeps the forecasting interface intact. Price/supplier/stock/transit are deliberately excluded from predictors: their future values are not known.
-7. Split **unique dates** 80/20, train on earlier dates only, recursively forecast the entire holdout without actual-demand feedback. Optional TimeSeriesSplit also splits dates. The recursive 7-day moving-average baseline uses exactly the same information. Short-history SKUs use recent means. SKUs first appearing in holdout cannot be evaluated at the earlier origin.
-8. Report MAE, RMSE and MAPE (percent, positive actuals only, null if no valid denominators). Primary metrics exclude censored and flagged abnormal targets; corrected-target metrics are labeled diagnostics. Select the forest per SKU only when it beats baseline MAE with at least seven reliable validation observations. Refit on all history and sum recursive daily predictions over the requested horizon.
-
-## Outputs and integration
-
-`outputs/forecast_output.csv` contains one row per SKU:
-
-| Fields | Meaning |
-|---|---|
-| sku, product_name | product identifiers |
-| forecast_demand, forecast_horizon_days, forecast_as_of | total regular-demand forecast, horizon and historical cutoff |
-| growth_rate, trend_direction | fractional growth; increasing/stable/decreasing at ±10% |
-| seasonality_detected, seasonality_strength | descriptive weekly pattern indicator |
-| estimated_lost_demand | historical total across the supplied dataset, not future demand |
-| outliers_detected, large_client_orders_detected | historical daily-outlier and client-order counts; can overlap |
-| model_used | random_forest, baseline_7d or fallback_7d |
-| baseline_mae, model_mae | per-SKU validation MAE; blank when unavailable |
-| forecast_confidence | low/medium heuristic based on history, sample count and normalized validation error |
-| forecast_reason | human-readable explanation |
-| supplier, category, lead_time_days, stock, in_transit, price | latest available metadata if supplied |
-
-`daily_forecast.csv` provides dated predictions for lead-time alignment. The procurement service joins by SKU and combines the demand forecast with **fresh** inventory, in-transit shipments, safety stock and supplier lead time. Metadata snapshots in this file may be stale; no final order quantity is emitted.
-
-Other artifacts: `metrics.json`, `validation_predictions.csv`, `data/processed/transactions_audit.csv`, `data/processed/daily_demand.csv`, `models/demand_model.joblib` (model/config/selection/cutoff), optional SKU chart. Reloaded models require compatible dependency versions and a corrected demand history to build inference features; never load untrusted joblib files.
-
-## Assumptions and limitations
-
-- Missing calendar days imply zero recorded sales and unknown stock. This requires a complete sales extract; missing feeds, closed days or discontinued products need explicit handling upstream.
-- Inventory is assumed to be a repeated end-of-day warehouse snapshot, not inventory movements. Without warehouse IDs, stock is a single SKU snapshot. Separate inventory/supplier tables must be joined upstream by effective date. Multiple suppliers per SKU are reduced to the last nonmissing value; richer supplier allocation belongs downstream.
-- A warehouse-level explicit stockout can mark the whole SKU-day. Partial-warehouse availability needs a warehouse-level model for higher precision.
-- Stockout corrections are estimates. The system cannot recover censored demand with no history. Robust caps may suppress genuine demand shifts, promotions or intermittent demand spikes; review audit flags. First-week anomalies cannot be identified reliably.
-- Confidence labels are **not calibrated probabilities or intervals**. Model selection uses the validation set, so selected-model performance needs a separate untouched test period before production claims. Default holdout spans 20% of history, potentially longer than the requested forecast horizon.
-- Weekly seasonality is reported; annual features can help prediction but one year is insufficient to establish repeatable annual patterns. Forests do not extrapolate long-term growth well; recursive long-horizon error accumulates.
-- One global model avoids per-SKU model explosion; daily expansion is O(SKUs × days), and sparse one-hot encoding avoids a dense SKU matrix. 1,000+ SKUs are supported by the architecture but not benchmarked here; large transaction extracts may need batching/vectorized client detection.
-- Quantities must use consistent units per SKU; returns are excluded, not netted. No external prices, calendars or real company data were used.
-
-## Verified synthetic run
-
-Python 3.12; 80/20 date split; 1,568 reliable validation SKU-days (32 flagged days excluded). These are synthetic-data results, not production accuracy claims.
-
-| Model | MAE | RMSE | MAPE |
-|---|---:|---:|---:|
-| Recursive 7-day mean | 8.8483 | 12.1760 | 33.91% |
-| Global RandomForest | 5.9552 | 8.3193 | 22.29% |
-
-The audit detected 20 bulk client orders, 93 daily outliers and 260 stockout SKU-days; it estimated 7,992.5 lost units. Holding history fixed, weekday feature changes produced a 2.41-unit daily prediction range. Changing only growth from -30% to +30% changed the prediction from 26.10 to 25.12: the forest uses growth but is **not monotonic**, and this artificial feature intervention does not establish a causal growth response. A recent injected 1,000-unit order changed the cleaned-history 30-day forecast from 664.34 to 665.45 (+0.17%) with the fitted model held fixed.
+- Пропущенный день в выгрузке означает, что продаж не было. Нужна полная выгрузка продаж.
+- Остаток в продажах считается снимком на конец дня по складу. Для актуального расчёта лучше передавать свежие остатки через `--stock`: в отчёте указано, на какую дату взят остаток (`stock_as_of`).
+- Если у артикула несколько поставщиков, берётся последний указанный или тот, что в номенклатуре. Распределение заказа между несколькими поставщиками не реализовано.
+- Оценка упущенного спроса приблизительная. Для нового товара без истории её нет.
+- Годовая сезонность оценивается по одному прошлому году: при истории больше года используется сдвиг на 52 недели. Лесная модель плохо продолжает тренды, поэтому тренд вынесен в отдельный прозрачный множитель.
+- Уровень «уверенности» — эвристика, а не доверительный интервал. Модель выбиралась на той же валидации, поэтому для оценки качества в продакшене нужен отдельный период.
+- Файл модели `models/demand_model.joblib` нельзя загружать из недоверенных источников.

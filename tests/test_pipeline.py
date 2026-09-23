@@ -1,4 +1,3 @@
-"""Behavioral tests for corrections, leakage, input formats and handoff schema."""
 import tempfile
 import unittest
 from pathlib import Path
@@ -38,7 +37,7 @@ class DemandTests(unittest.TestCase):
         bulk = result[result.date == frame.loc[40, 'date']]
         self.assertTrue(bulk.is_large_client_order.all())
         self.assertEqual(bulk.large_client_order_count.sum(), 1)
-        self.assertAlmostEqual(bulk.quantity_clean.sum(), 30.)
+        self.assertAlmostEqual(bulk.quantity_clean.sum(), 10.)
 
     def test_stockout_and_partial_sales(self):
         frame = fixture()
@@ -93,7 +92,8 @@ class DemandTests(unittest.TestCase):
             root = Path(directory)
             path = root / 'sales.csv'
             fixture(5).to_csv(path, index=False)
-            output = run_pipeline(path, Config(forecast_days=7, output_dir=root/'out', processed_dir=root/'processed', model_dir=root/'models'))
+            run_pipeline(path, Config(forecast_days=7, output_dir=root/'out', processed_dir=root/'processed', model_dir=root/'models'))
+            output = pd.read_csv(root / 'out' / 'forecast_output.csv', dtype={'sku': str})
             required = {'sku', 'product_name', 'forecast_demand', 'forecast_horizon_days', 'growth_rate',
                         'trend_direction', 'seasonality_detected', 'estimated_lost_demand',
                         'outliers_detected', 'large_client_orders_detected', 'model_used',

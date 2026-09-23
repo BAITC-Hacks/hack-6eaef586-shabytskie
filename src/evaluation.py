@@ -1,4 +1,3 @@
-"""Date-based holdout and optional expanding-window evaluation."""
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
@@ -7,7 +6,6 @@ from src.forecasting import predict_future, train_model
 
 
 def metrics(actual: pd.Series, predicted: pd.Series) -> dict:
-    """MAPE excludes zero actuals; return None when no valid denominator exists."""
     actual, predicted = np.asarray(actual), np.asarray(predicted)
     error = predicted - actual
     nonzero = actual > 0
@@ -17,7 +15,6 @@ def metrics(actual: pd.Series, predicted: pd.Series) -> dict:
 
 
 def evaluate(daily: pd.DataFrame, config: Config, cv_splits: int = 0) -> tuple[pd.DataFrame, dict]:
-    """Split unique dates, never rows or SKUs; recursively predict whole holdout."""
     dates = np.sort(daily.date.unique())
     if len(dates) < 10:
         return pd.DataFrame(), {'status': 'insufficient_history'}
@@ -42,8 +39,7 @@ def evaluate(daily: pd.DataFrame, config: Config, cv_splits: int = 0) -> tuple[p
         joined['model_available'] = model is not None
         results.append(joined)
     predictions = pd.concat(results, ignore_index=True)
-    # Corrections are estimates, not ground truth. Select/evaluate on uncensored,
-    # unflagged observations; separately report corrected-target diagnostics.
+    # Качество оценивается только на днях без дефицита и аномалий: коррекции — оценка, а не факт.
     reliable = predictions[~(predictions.stockout_flag | predictions.is_outlier | predictions.is_large_client_order)]
     report = {'status': 'ok' if len(reliable) else 'no_reliable_test_targets',
               'folds': len(splits), 'evaluation_rows': len(reliable),

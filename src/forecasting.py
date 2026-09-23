@@ -1,4 +1,3 @@
-"""Replaceable global estimator and common recursive forecast strategy."""
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
@@ -11,7 +10,6 @@ from src.feature_engineering import FEATURES, NUMERIC_FEATURES, engineer_feature
 
 
 def train_model(daily: pd.DataFrame, config: Config) -> Pipeline | None:
-    """Fit one global forest; one-hot SKU encoding tolerates new identifiers."""
     features = engineer_features(daily)
     features = features[features.groupby('sku').cumcount() >= config.min_history]
     if len(features) < 20:
@@ -28,7 +26,6 @@ def train_model(daily: pd.DataFrame, config: Config) -> Pipeline | None:
 
 def predict_future(history: pd.DataFrame, days: int, model: Pipeline | None, config: Config,
                    methods: dict[str, str] | None = None) -> pd.DataFrame:
-    """Predict without seeing future actuals; feed predictions back into lags."""
     histories = {str(sku): g.adjusted_demand.tolist() for sku, g in history.groupby('sku', sort=False)}
     trained_skus = {sku for sku, values in histories.items() if len(values) > config.min_history}
     end = history.date.max()
@@ -45,5 +42,6 @@ def predict_future(history: pd.DataFrame, days: int, model: Pipeline | None, con
                 prediction, used = float(predictions[idx]), 'random_forest'
             prediction = max(0., prediction)
             rows.append(dict(sku=sku, date=date, prediction=prediction, model_used=used))
+            # Рекурсивный прогноз: предсказание становится лагом для следующего дня.
             histories[sku].append(prediction)
     return pd.DataFrame(rows)

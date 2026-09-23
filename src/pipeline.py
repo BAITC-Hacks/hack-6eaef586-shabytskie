@@ -1,4 +1,3 @@
-"""End-to-end orchestration and procurement-service handoff artifacts."""
 import json
 import logging
 from pathlib import Path
@@ -6,25 +5,27 @@ import joblib
 import pandas as pd
 from src.anomaly_detection import detect_client_orders, detect_daily_outliers
 from src.config import Config
-from src.data_loader import load_data
+from src.data_loader import load_data, load_reference
 from src.evaluation import evaluate, metrics
 from src.feature_engineering import feature_row, seasonality
 from src.forecasting import predict_future, train_model
+from src.ordering import export_orders, recommend_orders, sku_parameters, supplier_summary
 from src.preprocessing import aggregate_daily, clean_transactions
-from src.stockout import correct_stockouts
+from src.stockout import apply_stockout_periods, correct_stockouts
 
 
-def prepare(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Keep transaction audit and fully corrected daily history."""
+def prepare(frame: pd.DataFrame, stockouts: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     transactions = detect_client_orders(clean_transactions(frame))
-    daily = correct_stockouts(detect_daily_outliers(aggregate_daily(transactions)))
+    daily = apply_stockout_periods(aggregate_daily(transactions), stockouts)
+    daily = correct_stockouts(detect_daily_outliers(daily))
     return transactions, daily
 
 
 def build_output(daily: pd.DataFrame, future: pd.DataFrame, validation: pd.DataFrame,
                  config: Config) -> pd.DataFrame:
-    """Summarize expected horizon demand; never calculate procurement quantities."""
     rows = []
+    horizon_end = daily.date.max() + pd.Timedelta(days=config.forecast_days)
+    future = future[future.date <= horizon_end]
     for sku, group in daily.groupby('sku', sort=False):
         forecast = future[future.sku == sku]
         growth = feature_row(sku, group.date.max() + pd.Timedelta(days=1), group.adjusted_demand.tolist())['growth_rate']
@@ -50,18 +51,17 @@ def build_output(daily: pd.DataFrame, future: pd.DataFrame, validation: pd.DataF
             if col in group and group[col].notna().any():
                 row[col] = group[col].dropna().iloc[-1]
         row['forecast_reason'] = (
-            f"Forecast demand for the next {config.forecast_days} days is {row['forecast_demand']:.1f} units. "
-            f"Recent 30-day demand changed by {growth:+.1%} versus the previous period. "
-            f"Estimated historical lost demand: {row['estimated_lost_demand']:.1f} units. "
-            f"Capped {row['large_client_orders_detected']} large client orders and {row['outliers_detected']} daily outliers. "
-            f"Method: {row['model_used']}. Confidence is a heuristic, not a prediction interval.")
+            f"Прогноз спроса на {config.forecast_days} дн.: {row['forecast_demand']:.1f} ед. "
+            f"Спрос за последние 30 дн. изменился на {growth:+.1%} к предыдущему периоду. "
+            f"Оценка упущенного спроса за историю: {row['estimated_lost_demand']:.1f} ед. "
+            f"Ограничено разовых крупных заказов: {row['large_client_orders_detected']}, дневных выбросов: {row['outliers_detected']}. "
+            f"Метод: {row['model_used']}. Уверенность — эвристика, не доверительный интервал.")
         rows.append(row)
     return pd.DataFrame(rows)
 
 
 def save_chart(daily: pd.DataFrame, future: pd.DataFrame, validation: pd.DataFrame,
                sku: str, directory: Path) -> None:
-    """Write a selected-SKU audit/forecast plot using a headless backend."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -86,11 +86,33 @@ def save_chart(daily: pd.DataFrame, future: pd.DataFrame, validation: pd.DataFra
 
 
 def run_pipeline(input_path: str | Path, config: Config, chart_sku: str | None = None,
-                 cv_splits: int = 0) -> pd.DataFrame:
-    """Load, correct, evaluate, refit, recursively forecast and persist artifacts."""
+                 cv_splits: int = 0, suppliers_path: str | Path | None = None,
+                 catalog_path: str | Path | None = None, stock_path: str | Path | None = None,
+                 stockouts_path: str | Path | None = None, growth_path: str | Path | None = None,
+                 warehouse: str | None = None, category: str | None = None) -> pd.DataFrame:
     for directory in [config.output_dir, config.processed_dir, config.model_dir]:
         directory.mkdir(parents=True, exist_ok=True)
-    transactions, daily = prepare(load_data(input_path))
+    suppliers = load_reference(suppliers_path, {'supplier'})
+    catalog = load_reference(catalog_path, {'sku'})
+    stock = load_reference(stock_path, {'sku', 'stock'})
+    stockouts = load_reference(stockouts_path, {'sku', 'date_from'})
+    growth = load_reference(growth_path, {'growth_forecast'})
+    frame = load_data(input_path)
+    if warehouse:
+        if 'warehouse' not in frame:
+            raise ValueError('--warehouse requires a warehouse column in sales data')
+        frame = frame[frame.warehouse.astype(str).str.strip() == warehouse]
+        if stock is not None and 'warehouse' in stock:
+            stock = stock[stock.warehouse == warehouse]
+        if frame.empty:
+            raise ValueError(f'No rows for warehouse {warehouse!r}')
+    transactions, daily = prepare(frame, stockouts)
+    if category:
+        params = sku_parameters(daily, config, catalog, suppliers)
+        selected = set(params.sku[params.category == category])
+        if not selected:
+            raise ValueError(f'No SKUs in category {category!r}')
+        daily = daily[daily.sku.isin(selected)].reset_index(drop=True)
     logging.info('Found %d SKUs', daily.sku.nunique())
     logging.info('Detected %d SKU-level outliers', daily.is_outlier.sum())
     logging.info('Detected %d large single-client orders', daily.large_client_orders_detected.sum())
@@ -101,7 +123,7 @@ def run_pipeline(input_path: str | Path, config: Config, chart_sku: str | None =
         reliable = validation[~(validation.stockout_flag | validation.is_outlier | validation.is_large_client_order)]
         for sku, group in reliable.groupby('sku'):
             methods[sku] = 'random_forest' if len(group) >= 7 and (group.quantity - group.model_prediction).abs().mean() < (group.quantity - group.baseline_prediction).abs().mean() else 'baseline_7d'
-    # No evidence of improvement => baseline, including newly introduced SKUs.
+    # Модель используется для артикула, только если на валидации она точнее 7-дневной средней.
     for sku in daily.sku.unique():
         methods.setdefault(sku, 'baseline_7d')
     if 'baseline' in report:
@@ -109,8 +131,16 @@ def run_pipeline(input_path: str | Path, config: Config, chart_sku: str | None =
         if report['random_forest_worse_than_baseline']:
             logging.warning('RandomForest performs worse than baseline on validation')
     model = train_model(daily, config)
-    future = predict_future(daily, config.forecast_days, model, config, methods)
+    # Горизонт прогноза должен покрывать самый длинный срок поставки + период пересмотра.
+    lead_times = sku_parameters(daily, config, catalog, suppliers).lead_time_days
+    horizon = max(config.forecast_days, int(lead_times.max()) + config.review_period_days)
+    future = predict_future(daily, horizon, model, config, methods)
     output = build_output(daily, future, validation, config)
+    orders = recommend_orders(daily, future, config, output, catalog, suppliers, stock, growth)
+    files = export_orders(orders, config.output_dir)
+    for _, row in supplier_summary(orders).iterrows():
+        logging.info('Order for %s: %d positions, %.0f units, %d critical', row.supplier,
+                     row.positions, row.total_qty, row.critical_positions)
     transactions.to_csv(config.processed_dir / 'transactions_audit.csv', index=False)
     daily.to_csv(config.processed_dir / 'daily_demand.csv', index=False)
     validation.to_csv(config.output_dir / 'validation_predictions.csv', index=False)
@@ -120,5 +150,5 @@ def run_pipeline(input_path: str | Path, config: Config, chart_sku: str | None =
     joblib.dump({'model': model, 'config': config, 'methods': methods, 'as_of': daily.date.max()}, config.model_dir / 'demand_model.joblib')
     if chart_sku:
         save_chart(daily, future, validation, chart_sku, config.output_dir / 'charts')
-    logging.info('Saved %s', config.output_dir / 'forecast_output.csv')
-    return output
+    logging.info('Saved %s, %s and %s', config.output_dir / 'forecast_output.csv', files['xlsx'], files['csv_1c'])
+    return orders

@@ -1,30 +1,30 @@
 {
   "calendar_sensitivity": {
     "weekday_predictions_fixed_history": [
-      25.363485472860475,
-      25.236925949050953,
-      25.137347001682528,
-      24.532227954063483,
-      23.1578749074685,
-      22.956870521503582,
-      23.05096575959882
+      26.449301884866227,
+      27.366374659635724,
+      27.260175326762482,
+      26.98855627914343,
+      25.827341525042915,
+      25.089861366312757,
+      25.067361366312756
     ],
-    "prediction_range": 2.406614951356893
+    "prediction_range": 2.299013293322968
   },
   "growth_sensitivity": {
-    "prediction_at_minus_30_percent": 26.102618093711836,
-    "prediction_at_plus_30_percent": 25.116997377622376,
-    "difference": -0.9856207160894606
+    "prediction_at_minus_30_percent": 27.369188302610837,
+    "prediction_at_plus_30_percent": 26.116189278636007,
+    "difference": -1.25299902397483
   },
   "stockout_correction": {
-    "stockout_sku_days": 260,
-    "total_lost_demand_estimated": 7992.5
+    "stockout_sku_days": 265,
+    "total_lost_demand_estimated": 8026.5
   },
   "bulk_order_sensitivity": {
     "injected_units": 1000,
-    "original_30_day_forecast": 664.337307155776,
-    "perturbed_30_day_forecast": 665.4506085610623,
-    "forecast_change_percent": 0.16758074449447768,
+    "original_30_day_forecast": 690.4373247849434,
+    "perturbed_30_day_forecast": 688.7548856097759,
+    "forecast_change_percent": -0.24367732084755733,
     "note": "Fixed fitted model; altered history is reprocessed before forecasting."
   }
 }
