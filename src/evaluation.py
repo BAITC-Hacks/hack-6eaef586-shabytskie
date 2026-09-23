@@ -3,6 +3,7 @@ import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
 from src.config import Config
 from src.forecasting import predict_future, train_model
+from src.security import bounded_number
 
 
 def metrics(actual: pd.Series, predicted: pd.Series) -> dict:
@@ -15,6 +16,7 @@ def metrics(actual: pd.Series, predicted: pd.Series) -> dict:
 
 
 def evaluate(daily: pd.DataFrame, config: Config, cv_splits: int = 0) -> tuple[pd.DataFrame, dict]:
+    bounded_number(cv_splits, 'cv_splits', 0, 5, integer=True)
     dates = np.sort(daily.date.unique())
     if len(dates) < 10:
         return pd.DataFrame(), {'status': 'insufficient_history'}

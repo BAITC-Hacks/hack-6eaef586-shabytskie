@@ -53,5 +53,11 @@ def detect_daily_outliers(daily: pd.DataFrame) -> pd.DataFrame:
     result['outlier_upper_bound'] = bounds
     result['is_outlier'] = result.quantity_clean.gt(bounds)
     result['quantity_clean'] = result.quantity_clean.where(~result.is_outlier, bounds)
+    # Extreme anonymous bulk orders must not leave an inflated cap in the model's
+    # recent lags. Replace them with a typical past selling day, using no future data.
+    typical = eligible.groupby(result.sku).transform(
+        lambda values: values.shift(1).rolling(90, min_periods=7).median())
+    extreme = eligible.gt(3 * bounds) & typical.notna()
+    result.loc[extreme, 'quantity_clean'] = typical[extreme]
     result['is_large_client_order'] = result.large_client_orders_detected.gt(0)
     return result

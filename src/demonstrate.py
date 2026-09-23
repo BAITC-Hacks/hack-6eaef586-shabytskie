@@ -1,20 +1,18 @@
 import json
 from pathlib import Path
-import joblib
 import numpy as np
 import pandas as pd
 from src.config import Config
 from src.data_loader import load_data
 from src.feature_engineering import FEATURES, feature_row
-from src.forecasting import predict_future
+from src.forecasting import predict_future, train_model
 from src.pipeline import prepare
 
 
 def main() -> None:
     raw = load_data('data/demo/synthetic_sales.csv')
     _, daily = prepare(raw)
-    bundle = joblib.load('models/demand_model.joblib')
-    model = bundle['model']
+    model = train_model(daily, Config())
     group = daily[daily.sku == 'SKU001']
     history = group.adjusted_demand.tolist()
     date = group.date.max() + pd.Timedelta(days=1)

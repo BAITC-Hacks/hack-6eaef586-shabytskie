@@ -5,6 +5,15 @@ __pycache__/
 models/
 .pytest_cache/
 .streamlit/secrets.toml
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.coverage
+htmlcov/
 data/raw/*
 data/processed/*
 outputs/*

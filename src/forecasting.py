@@ -7,6 +7,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from src.config import Config
 from src.feature_engineering import FEATURES, NUMERIC_FEATURES, engineer_features, feature_row
+from src.security import bounded_number
 
 
 def train_model(daily: pd.DataFrame, config: Config) -> Pipeline | None:
@@ -19,13 +20,14 @@ def train_model(daily: pd.DataFrame, config: Config) -> Pipeline | None:
         ('numeric', SimpleImputer(strategy='constant', fill_value=0), NUMERIC_FEATURES),
     ])
     model = Pipeline([('features', processor), ('regressor', RandomForestRegressor(
-        n_estimators=100, max_depth=16, min_samples_leaf=3, n_jobs=-1, random_state=config.random_state))])
+        n_estimators=100, max_depth=16, min_samples_leaf=3, n_jobs=1, random_state=config.random_state))])
     model.fit(features[FEATURES], features.adjusted_demand)
     return model
 
 
 def predict_future(history: pd.DataFrame, days: int, model: Pipeline | None, config: Config,
                    methods: dict[str, str] | None = None) -> pd.DataFrame:
+    bounded_number(days, 'forecast_days', 1, 3653, integer=True)
     histories = {str(sku): g.adjusted_demand.tolist() for sku, g in history.groupby('sku', sort=False)}
     trained_skus = {sku for sku, values in histories.items() if len(values) > config.min_history}
     end = history.date.max()

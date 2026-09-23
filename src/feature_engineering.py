@@ -10,7 +10,7 @@ FEATURES = ['sku'] + NUMERIC_FEATURES
 
 def feature_row(sku: str, date: pd.Timestamp, history: list[float]) -> dict:
     # history содержит только дни до целевого — будущие данные в признаки не попадают.
-    h = np.asarray(history, dtype=float)
+    h = np.asarray(history[-60:], dtype=float)
     row = dict(sku=str(sku), day_of_week=date.dayofweek, week_of_year=int(date.isocalendar().week),
                month=date.month, quarter=date.quarter, day_of_month=date.day,
                year_sin=np.sin(2 * np.pi * date.dayofyear / 365.25),

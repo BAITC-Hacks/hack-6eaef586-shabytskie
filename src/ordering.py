@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 from src.config import Config
 from src.preprocessing import SPACES
+from src.secure_files import spreadsheet_safe, safe_sheet_name
+from src.security import MAX_QUANTITY, SecurityError, bounded_number
 
 URGENCY_ORDER = {'требуются данные': -1, 'критично': 0, 'высокая': 1, 'плановая': 2, 'не требуется': 3}
 STATUS_DRAFT = 'черновик — требует утверждения'
@@ -35,6 +37,8 @@ def _number(value, default=None):
         number = float(re.sub(SPACES, '', str(value)).replace(',', '.'))
     except (TypeError, ValueError):
         return default
+    if math.isinf(number) or number > MAX_QUANTITY:
+        raise SecurityError('numeric_bounds', 'Числовой параметр превышает допустимый предел.')
     return default if math.isnan(number) or number < 0 else number
 
 
@@ -61,6 +65,7 @@ def sku_parameters(daily: pd.DataFrame, config: Config, catalog: pd.DataFrame | 
             if item['min_order_qty'] is None and 'min_order_qty' in info and pd.notna(info['min_order_qty']):
                 item['min_order_qty'] = info['min_order_qty']
         item['lead_time_days'] = int(round(_number(item['lead_time_days'], config.default_lead_time_days))) or config.default_lead_time_days
+        bounded_number(item['lead_time_days'], 'lead_time_days', 1, 275, integer=True)
         item['min_order_qty'] = _number(item['min_order_qty'], 0.)
         item['order_multiple'] = _number(item['order_multiple'], 1.) or 1.
         item['price'] = _number(item['price'])
@@ -109,15 +114,26 @@ def current_inventory(daily: pd.DataFrame, stock: pd.DataFrame | None = None) ->
 
 
 def annual_factor(group: pd.DataFrame, start: pd.Timestamp, coverage: int) -> float | None:
-    series = group.set_index('date').adjusted_demand
+    history = group.set_index('date')
+    # Daily outlier caps can suppress a sustained seasonal transition. Estimate
+    # the already-observed annual shape from sales, robustly clipping the tails
+    # within each window. Stockout days still use the imputed demand.
+    series = history.quantity.where(~history.stockout_flag, history.adjusted_demand)
     # Отношение спроса прошлого года в будущем окне к 28 дням перед ним.
     # Сдвиг на 52 недели (364 дня) сохраняет совпадение дней недели.
     origin = start - pd.Timedelta(days=364)
     window = series[origin:origin + pd.Timedelta(days=coverage - 1)]
     base = series[origin - pd.Timedelta(days=28):origin - pd.Timedelta(days=1)]
-    if len(window) < coverage or len(base) < 28 or base.mean() <= 0:
+    if len(window) < coverage or len(base) < 28:
         return None
-    return float(np.clip(window.mean() / base.mean(), .5, 2.))
+    def typical_mean(values):
+        if values.eq(0).mean() > .3:
+            return values.mean()  # Preserve intermittent demand, including zero days.
+        return values.clip(lower=values.quantile(.1), upper=values.quantile(.9)).mean()
+    base_level = typical_mean(base)
+    if base_level <= 0:
+        return None
+    return float(np.clip(typical_mean(window) / base_level, .25, 4.))
 
 
 def trend_factor(group: pd.DataFrame, coverage: int) -> tuple[float, float | None]:
@@ -180,13 +196,14 @@ def recommend_orders(daily: pd.DataFrame, future: pd.DataFrame, config: Config,
         lead = int(p.lead_time_days)
         coverage = lead + config.review_period_days
         model_demand = forecast_window(future, sku, start, coverage)
-        forecast_method = future.loc[future.sku == sku, 'model_used'].iloc[0]
-        # RandomForest already receives month and annual sin/cos features. The
-        # explicit annual factor is only a fallback for moving-average methods.
-        seasonal = None if forecast_method == 'random_forest' else annual_factor(group, start, coverage)
+        seasonal = annual_factor(group, start, coverage)
+        # Use either a recent level with a historical seasonal shape, or the
+        # model forecast. Multiplying both would count seasonality twice.
+        demand_base = group.adjusted_demand.tail(28).mean() * coverage if seasonal is not None else model_demand
+        demand_method = 'уровень за 28 дней × годовая сезонность' if seasonal is not None else 'прогноз модели'
         trend, monthly = trend_factor(group, coverage)
         plan = planned_growth(growth, sku, p.category)
-        demand = model_demand * (seasonal or 1.) * trend * (1 + plan)
+        demand = demand_base * (seasonal or 1.) * trend * (1 + plan)
         daily_rate = demand / coverage
 
         # σ берётся из ошибки прогноза на валидации (σ ≈ 1.25·MAE), без неё — из разброса спроса.
@@ -207,8 +224,7 @@ def recommend_orders(daily: pd.DataFrame, future: pd.DataFrame, config: Config,
         need = demand + safety - available
         quantity = 0.
         if stock_known and need > 0:
-            quantity = math.ceil(need / p.order_multiple - 1e-9) * p.order_multiple
-            quantity = max(quantity, p.min_order_qty)
+            quantity = math.ceil(max(need, p.min_order_qty) / p.order_multiple - 1e-9) * p.order_multiple
         days_of_cover = available / daily_rate if daily_rate > 0 else float('inf')
         # Критично: запас закончится раньше, чем придёт поставка.
         if not stock_known:
@@ -235,6 +251,7 @@ def recommend_orders(daily: pd.DataFrame, future: pd.DataFrame, config: Config,
                    days_of_cover=(round(days_of_cover, 1)
                                   if days_of_cover is not None and np.isfinite(days_of_cover) else None),
                    lead_time_days=lead, coverage_days=coverage, model_demand=round(model_demand, 2),
+                   demand_base=round(demand_base, 2), demand_method=demand_method,
                    seasonal_factor=round(seasonal, 4) if seasonal else None, trend_factor=round(trend, 4),
                    planned_growth=plan, demand_for_coverage=round(demand, 1), safety_stock=round(safety, 1),
                    stock=on_hand, stock_as_of=inv.stock_as_of, in_transit=in_transit, net_need=round(need, 1),
@@ -253,7 +270,8 @@ def recommend_orders(daily: pd.DataFrame, future: pd.DataFrame, config: Config,
 
 def explain(row: dict, monthly: float | None, error_source: str) -> str:
     parts = [f"Покрытие {row['coverage_days']} дн. (поставка {row['lead_time_days']} + пересмотр "
-             f"{row['coverage_days'] - row['lead_time_days']}): прогноз модели {row['model_demand']:.0f} ед."]
+             f"{row['coverage_days'] - row['lead_time_days']}): {row['demand_method']}, "
+             f"база {row['demand_base']:.0f} ед."]
     if row['seasonal_factor']:
         parts.append(f"годовая сезонность ×{row['seasonal_factor']:.2f}")
     if monthly is not None:
@@ -300,7 +318,7 @@ def validate_approved_orders(orders: pd.DataFrame) -> pd.DataFrame:
     """Validate manual quantities before creating approval artifacts."""
     result = orders.copy()
     quantities = pd.to_numeric(result['approved_qty'], errors='coerce')
-    invalid = quantities.isna() | ~np.isfinite(quantities) | quantities.lt(0)
+    invalid = quantities.isna() | ~np.isfinite(quantities) | quantities.lt(0) | quantities.gt(MAX_QUANTITY)
     if invalid.any():
         skus = ', '.join(result.loc[invalid, 'sku'].astype(str).tolist())
         raise ValueError(f'Утверждённое количество должно быть неотрицательным числом: {skus}')
@@ -332,7 +350,7 @@ EXPORT_COLUMNS = {
 
 def to_1c_csv(table: pd.DataFrame) -> bytes:
     # Для 1С и русского Excel: разделитель «;», десятичная запятая, UTF-8 с BOM, целые без «.0».
-    table = table.copy()
+    table = spreadsheet_safe(table)
     for col in table.select_dtypes('number'):
         values = table[col]
         if values.dropna().eq(values.dropna().round()).all():
@@ -343,22 +361,19 @@ def to_1c_csv(table: pd.DataFrame) -> bytes:
 def export_orders(orders: pd.DataFrame, directory) -> dict:
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    readable = orders[list(EXPORT_COLUMNS)].rename(columns=EXPORT_COLUMNS)
+    readable = spreadsheet_safe(orders[list(EXPORT_COLUMNS)].rename(columns=EXPORT_COLUMNS))
     xlsx = directory / 'supplier_orders.xlsx'
     with pd.ExcelWriter(xlsx, engine='openpyxl') as writer:
-        supplier_summary(orders).rename(columns={
+        spreadsheet_safe(supplier_summary(orders).rename(columns={
             'supplier': 'Поставщик', 'positions': 'Позиций', 'total_qty': 'Количество',
-            'total_value': 'Сумма', 'critical_positions': 'Критичных'}).to_excel(writer, sheet_name='Сводка', index=False)
+            'total_value': 'Сумма', 'critical_positions': 'Критичных'})).to_excel(writer, sheet_name='Сводка', index=False)
         readable.to_excel(writer, sheet_name='Все позиции', index=False)
-        used = set()
+        used = {'сводка', 'все позиции'}
         for supplier, group in readable[readable['Рекомендуемое количество'] > 0].groupby('Поставщик'):
-            name = ''.join(c for c in str(supplier) if c not in '[]:*?/\\')[:31] or 'Поставщик'
-            while name in used:
-                name = name[:28] + f'_{len(used)}'
-            used.add(name)
+            name = safe_sheet_name(str(supplier), used)
             group.to_excel(writer, sheet_name=name, index=False)
     csv = directory / 'supplier_orders_1c.csv'
     csv.write_bytes(to_1c_csv(readable[readable['Рекомендуемое количество'] > 0]))
     full = directory / 'supplier_orders.csv'
-    orders.to_csv(full, index=False)
+    spreadsheet_safe(orders).to_csv(full, index=False)
     return {'xlsx': xlsx, 'csv_1c': csv, 'csv': full}

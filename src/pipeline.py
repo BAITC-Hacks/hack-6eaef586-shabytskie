@@ -12,6 +12,8 @@ from src.forecasting import predict_future, train_model
 from src.ordering import export_orders, recommend_orders, sku_parameters, supplier_summary
 from src.preprocessing import aggregate_daily, clean_transactions
 from src.stockout import apply_stockout_periods, correct_stockouts
+from src.secure_files import spreadsheet_safe
+from src.security import bounded_text, bounded_number
 
 
 def prepare(frame: pd.DataFrame, stockouts: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -90,6 +92,10 @@ def run_pipeline(input_path: str | Path, config: Config, chart_sku: str | None =
                  catalog_path: str | Path | None = None, stock_path: str | Path | None = None,
                  stockouts_path: str | Path | None = None, growth_path: str | Path | None = None,
                  warehouse: str | None = None, category: str | None = None) -> pd.DataFrame:
+    warehouse = bounded_text(warehouse, 'warehouse')
+    category = bounded_text(category, 'category')
+    chart_sku = bounded_text(chart_sku, 'chart_sku')
+    bounded_number(cv_splits, 'cv_splits', 0, 5, integer=True)
     for directory in [config.output_dir, config.processed_dir, config.model_dir]:
         directory.mkdir(parents=True, exist_ok=True)
     suppliers = load_reference(suppliers_path, {'supplier'})
@@ -141,18 +147,18 @@ def run_pipeline(input_path: str | Path, config: Config, chart_sku: str | None =
     future = predict_future(daily, horizon, model, config, methods)
     output = build_output(daily, future, validation, config)
     orders = recommend_orders(daily, future, config, output, catalog, suppliers, stock, growth)
-    files = export_orders(orders, config.output_dir)
-    for _, row in supplier_summary(orders).iterrows():
-        logging.info('Order for %s: %d positions, %.0f units, %d critical', row.supplier,
-                     row.positions, row.total_qty, row.critical_positions)
-    transactions.to_csv(config.processed_dir / 'transactions_audit.csv', index=False)
-    daily.to_csv(config.processed_dir / 'daily_demand.csv', index=False)
-    validation.to_csv(config.output_dir / 'validation_predictions.csv', index=False)
-    future.to_csv(config.output_dir / 'daily_forecast.csv', index=False)
-    output.to_csv(config.output_dir / 'forecast_output.csv', index=False)
+    export_orders(orders, config.output_dir)
+    logging.info('Prepared %d supplier groups', len(supplier_summary(orders)))
+    if config.write_transaction_audit:
+        spreadsheet_safe(transactions).to_csv(config.processed_dir / 'transactions_audit.csv', index=False)
+    spreadsheet_safe(daily).to_csv(config.processed_dir / 'daily_demand.csv', index=False)
+    spreadsheet_safe(validation).to_csv(config.output_dir / 'validation_predictions.csv', index=False)
+    spreadsheet_safe(future).to_csv(config.output_dir / 'daily_forecast.csv', index=False)
+    spreadsheet_safe(output).to_csv(config.output_dir / 'forecast_output.csv', index=False)
     (config.output_dir / 'metrics.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
-    joblib.dump({'model': model, 'config': config, 'methods': methods, 'as_of': daily.date.max()}, config.model_dir / 'demand_model.joblib')
+    if config.persist_model:
+        joblib.dump({'model': model, 'config': config, 'methods': methods, 'as_of': daily.date.max()}, config.model_dir / 'demand_model.joblib')
     if chart_sku:
         save_chart(daily, future, validation, chart_sku, config.output_dir / 'charts')
-    logging.info('Saved %s, %s and %s', config.output_dir / 'forecast_output.csv', files['xlsx'], files['csv_1c'])
+    logging.info('Saved forecast and supplier order artifacts')
     return orders
