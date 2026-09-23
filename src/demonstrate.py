@@ -11,7 +11,7 @@ from src.pipeline import prepare
 
 
 def main() -> None:
-    raw = load_data('data/raw/synthetic_sales.csv')
+    raw = load_data('data/demo/synthetic_sales.csv')
     _, daily = prepare(raw)
     bundle = joblib.load('models/demand_model.joblib')
     model = bundle['model']

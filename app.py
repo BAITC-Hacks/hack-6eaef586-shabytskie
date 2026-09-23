@@ -7,11 +7,13 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 from src.config import Config
-from src.ordering import EXPORT_COLUMNS, URGENCY_ORDER, to_1c_csv
+from src.ordering import (EXPORT_COLUMNS, STATUS_MISSING_STOCK, URGENCY_ORDER, to_1c_csv,
+                          validate_approved_orders)
 from src.pipeline import run_pipeline
 
-DEMO = Path('data/raw')
-URGENCY_COLORS = {'критично': '🔴', 'высокая': '🟠', 'плановая': '🟢', 'не требуется': '⚪'}
+DEMO = Path('data/demo')
+URGENCY_COLORS = {'требуются данные': '⚫', 'критично': '🔴', 'высокая': '🟠',
+                  'плановая': '🟢', 'не требуется': '⚪'}
 SERIES = {'Продажи (факт)': '#8a8984', 'Спрос для расчёта': '#2a78d6', 'Прогноз': '#2a78d6'}
 ONE_OFF_COLOR, STOCKOUT_COLOR = '#eb6834', '#e34948'
 INPUTS = {
@@ -194,11 +196,13 @@ orders, daily, future = load_results(str(result_dir), (result_dir / 'outputs' / 
 st.caption(f"Расчёт по: {st.session_state.get('calculated_from', '—')}. Заказ — черновик, поставщику ничего не отправляется.")
 
 active = orders[orders.recommended_qty > 0]
-cols = st.columns(4)
+cols = st.columns(5)
 cols[0].metric('Позиций к заказу', len(active))
 cols[1].metric('Критичных', int((active.urgency == 'критично').sum()))
 cols[2].metric('Поставщиков', active.supplier.nunique())
 cols[3].metric('Сумма', f"{active.order_value.sum():,.0f}".replace(',', ' '))
+cols[4].metric('Нет остатков', int((orders.status == STATUS_MISSING_STOCK).sum()),
+               help='Рекомендация заблокирована: загрузите актуальные остатки')
 
 tab_orders, tab_card, tab_trends = st.tabs(['Заказы по поставщикам', 'Карточка артикула', 'Тренды по категориям'])
 
@@ -207,7 +211,7 @@ with tab_orders:
     show_all = st.checkbox('Показать позиции без заказа', False)
     view = orders[orders.supplier == supplier]
     if not show_all:
-        view = view[view.recommended_qty > 0]
+        view = view[(view.recommended_qty > 0) | (view.status == STATUS_MISSING_STOCK)]
     view = view.assign(urgency=view.urgency.map(lambda u: f"{URGENCY_COLORS.get(u, '')} {u}"))
     shown = ['sku', 'product_name', 'urgency', 'recommended_qty', 'approved_qty', 'days_of_cover',
              'lead_time_days', 'demand_for_coverage', 'safety_stock', 'stock', 'in_transit', 'reason']
@@ -218,16 +222,26 @@ with tab_orders:
         hide_index=True, width='stretch', key=f'editor_{supplier}')
     approver = st.text_input('Ответственный', '', key='approver')
     if st.button(f'Утвердить заказ: {supplier}', disabled=not approver.strip(), key='approve'):
-        approved = view.copy()
-        approved['approved_qty'] = edited['Утверждённое количество'].to_numpy()
-        approved = approved[approved.approved_qty > 0]
-        approved['urgency'] = approved.urgency.str.split(' ', n=1).str[-1]
-        approved['order_value'] = approved.approved_qty * approved.price
-        approved['status'] = f'утверждён: {approver.strip()} {datetime.now():%Y-%m-%d %H:%M}'
-        table = approved[list(EXPORT_COLUMNS)].rename(columns=EXPORT_COLUMNS)
-        stem = f"{''.join(c if c.isalnum() else '_' for c in supplier)}_{datetime.now():%Y%m%d_%H%M}"
-        # Утверждение только готовит файлы для ответственного — поставщику заказ автоматически не отправляется.
-        st.session_state.approved_file = (stem, to_excel(table), to_1c_csv(table))
+        try:
+            approved = view.copy()
+            approved['approved_qty'] = edited['Утверждённое количество'].to_numpy()
+            blocked_untouched = approved.status.eq(STATUS_MISSING_STOCK) & approved.approved_qty.isna()
+            approved.loc[blocked_untouched, 'approved_qty'] = 0.
+            approved = validate_approved_orders(approved)
+            approved = approved[approved.approved_qty > 0]
+            if approved.empty:
+                raise ValueError('Нет позиций с количеством больше 0: утверждать нечего.')
+            approved['urgency'] = approved.urgency.str.split(' ', n=1).str[-1]
+            approved['order_value'] = approved.approved_qty * approved.price
+            approved_at = datetime.now()
+            approved['status'] = f'утверждён: {approver.strip()} {approved_at:%Y-%m-%d %H:%M:%S}'
+            table = approved[list(EXPORT_COLUMNS)].rename(columns=EXPORT_COLUMNS)
+            stem = f"{''.join(c if c.isalnum() else '_' for c in supplier)}_{approved_at:%Y%m%d_%H%M%S}"
+            # Утверждение только готовит файлы для ответственного — поставщику заказ автоматически не отправляется.
+            st.session_state.approved_file = (stem, to_excel(table), to_1c_csv(table))
+        except ValueError as exc:
+            st.session_state.pop('approved_file', None)
+            st.error(str(exc))
     if 'approved_file' in st.session_state:
         stem, xlsx_bytes, csv_bytes = st.session_state.approved_file
         st.success(f'Заказ утверждён: {stem}. Скачайте файл и передайте поставщику.')
@@ -246,12 +260,13 @@ with tab_card:
     item = orders.set_index('sku').loc[sku]
 
     cols = st.columns(4)
-    cols[0].metric('Рекомендуемый заказ', f'{item.recommended_qty:,.0f} ед.'.replace(',', ' '))
+    blocked = item.status == STATUS_MISSING_STOCK
+    cols[0].metric('Рекомендуемый заказ', '— нет остатка' if blocked else f'{item.recommended_qty:,.0f} ед.'.replace(',', ' '))
     cols[1].metric('Срочность', f"{URGENCY_COLORS.get(item.urgency, '')} {item.urgency}")
     cols[2].metric('Запаса хватит на', f'{item.days_of_cover:.1f} дн.' if pd.notna(item.days_of_cover) else '—',
                    help=f'Срок поставки {item.lead_time_days} дн.')
     stock_text = f'{item.stock:.0f}' if item.stock_known else 'нет данных'
-    cols[3].metric('Доступно', f'{item.stock + item.in_transit:,.0f} ед.'.replace(',', ' '),
+    cols[3].metric('Доступно', 'нет данных' if blocked else f'{item.stock + item.in_transit:,.0f} ед.'.replace(',', ' '),
                    help=f'Остаток {stock_text} + в пути {item.in_transit:.0f}')
 
     history = daily[daily.sku == sku].tail(120).copy()
@@ -267,7 +282,7 @@ with tab_card:
     left, right = st.columns([3, 2])
     with left:
         st.subheader('Как получилось количество')
-        fmt = lambda v, unit='ед.': f'{v:,.0f} {unit}'.replace(',', ' ')
+        fmt = lambda v, unit='ед.': f'{v:,.0f} {unit}'.replace(',', ' ') if pd.notna(v) else '—'
         steps = [
             (f"Прогноз модели на {item.coverage_days} дн.", fmt(item.model_demand)),
             ('× годовая сезонность', f'{item.seasonal_factor:.2f}' if pd.notna(item.seasonal_factor) else '— (история < года)'),
@@ -275,7 +290,7 @@ with tab_card:
             ('× плановый прирост', f'{1 + item.planned_growth:.2f}'),
             ('= Спрос на период', fmt(item.demand_for_coverage)),
             ('+ Страховой запас', fmt(item.safety_stock)),
-            ('− Остаток', fmt(item.stock)),
+            ('− Остаток', 'нет данных' if blocked else fmt(item.stock)),
             ('− В пути', fmt(item.in_transit)),
             ('= Потребность', fmt(item.net_need)),
             (f'→ Заказ (кратность {item.order_multiple:.0f}, мин. партия {item.min_order_qty:.0f})', fmt(item.recommended_qty)),

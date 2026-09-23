@@ -97,6 +97,8 @@ def run_pipeline(input_path: str | Path, config: Config, chart_sku: str | None =
     stock = load_reference(stock_path, {'sku', 'stock'})
     stockouts = load_reference(stockouts_path, {'sku', 'date_from'})
     growth = load_reference(growth_path, {'growth_forecast'})
+    if growth is not None and not ({'sku', 'category'} & set(growth.columns)):
+        raise ValueError('Growth reference must contain either sku or category in addition to growth_forecast')
     frame = load_data(input_path)
     if warehouse:
         if 'warehouse' not in frame:

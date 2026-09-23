@@ -36,7 +36,10 @@ def predict_future(history: pd.DataFrame, days: int, model: Pipeline | None, con
         for idx, sku in enumerate(histories):
             method = (methods or {}).get(sku, 'random_forest')
             if model is None or sku not in trained_skus or method != 'random_forest':
-                prediction = float(np.mean(histories[sku][-7:]))
+                # У редко продаваемого товара (>30% дней без продаж) среднее за 7 дней слишком шумное — берём 28.
+                recent = np.asarray(histories[sku][-28:])
+                window = 28 if (recent == 0).mean() > .3 else 7
+                prediction = float(np.mean(histories[sku][-window:]))
                 used = 'baseline_7d' if sku in trained_skus else 'fallback_7d'
             else:
                 prediction, used = float(predictions[idx]), 'random_forest'

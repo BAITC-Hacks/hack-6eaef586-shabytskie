@@ -5,7 +5,8 @@ import numpy as np
 import pandas as pd
 from src.config import Config
 from src.forecasting import predict_future, train_model
-from src.ordering import annual_factor, parse_fraction, recommend_orders, supplier_summary
+from src.ordering import (annual_factor, current_inventory, parse_fraction, recommend_orders,
+                          supplier_summary, validate_approved_orders)
 from src.pipeline import prepare, run_pipeline
 
 CONFIG = Config()
@@ -42,6 +43,19 @@ class MustHave1AllSourcesAffectResult(unittest.TestCase):
     def test_stock_table_overrides_sales_snapshot(self):
         stock = pd.DataFrame({'sku': ['A1', 'A1'], 'warehouse': ['W1', 'W2'], 'stock': ['20', '30']})
         self.assertEqual(order(sales(), stock=stock).recommended_qty, 160)
+
+    def test_duplicate_warehouse_snapshot_is_not_double_counted(self):
+        stock = pd.DataFrame({'sku': ['A1', 'A1'], 'warehouse': ['W1', 'W1'],
+                              'stock': ['20', '20']})
+        _, daily = prepare(sales())
+        inventory = current_inventory(daily, stock).iloc[0]
+        self.assertEqual(inventory.stock, 20)
+
+    def test_latest_dated_warehouse_snapshot_wins(self):
+        stock = pd.DataFrame({'sku': ['A1', 'A1'], 'warehouse': ['W1', 'W1'],
+                              'date': ['2025-01-02', '2025-01-01'], 'stock': ['20', '90']})
+        _, daily = prepare(sales())
+        self.assertEqual(current_inventory(daily, stock).iloc[0].stock, 20)
 
     def test_sales_history(self):
         self.assertEqual(order(sales(qty=20.)).recommended_qty, 320)
@@ -83,11 +97,17 @@ class MustHave1AllSourcesAffectResult(unittest.TestCase):
         self.assertFalse(daily.stockout_flag.iloc[-1])
         self.assertEqual(daily.estimated_lost_demand.sum(), 0)
 
-    def test_unknown_stock_is_stated_in_reason(self):
+    def test_invalid_growth_is_rejected(self):
+        growth = pd.DataFrame({'sku': ['A1'], 'growth_forecast': ['-150%']})
+        with self.assertRaisesRegex(ValueError, 'growth_forecast'):
+            order(sales(), growth=growth)
+
+    def test_missing_stock_blocks_recommendation(self):
         result = order(sales().drop(columns='stock'))
-        self.assertFalse(result.stock_known)
-        self.assertIn('нет данных', result.reason)
-        self.assertEqual(result.recommended_qty, 210)
+        self.assertTrue(pd.isna(result.recommended_qty))
+        self.assertEqual(result.urgency, 'требуются данные')
+        self.assertIn('заблокирован', result.status)
+        self.assertIn('остаток неизвестен', result.reason)
 
 
 class MustHave2SeasonalityAndGrowth(unittest.TestCase):
@@ -106,6 +126,16 @@ class MustHave2SeasonalityAndGrowth(unittest.TestCase):
     def test_no_annual_factor_without_a_year_of_history(self):
         _, daily = prepare(sales())
         self.assertIsNone(annual_factor(daily, daily.date.max() + pd.Timedelta(days=1), 21))
+
+    def test_random_forest_does_not_apply_second_annual_factor(self):
+        dates = pd.date_range('2024-01-01', '2025-05-25')
+        frame = sales(len(dates), start='2024-01-01', stock=0.)
+        frame['quantity'] = np.where(dates.month.isin([6, 7, 8]), 30., 10.)
+        _, daily = prepare(frame)
+        future = predict_future(daily, 60, None, CONFIG)
+        future['model_used'] = 'random_forest'
+        result = recommend_orders(daily, future, CONFIG).iloc[0]
+        self.assertIsNone(result.seasonal_factor)
 
     def test_weekly_pattern_in_model_forecast(self):
         dates = pd.date_range('2025-01-06', periods=140)
@@ -134,6 +164,25 @@ class MustHave2SeasonalityAndGrowth(unittest.TestCase):
 
 
 class MustHave3LostDemand(unittest.TestCase):
+
+    def test_slow_mover_keeps_its_demand(self):
+        rng = np.random.default_rng(1)
+        frame = sales(200, qty=0., stock=0.)
+        frame['quantity'] = np.where(rng.random(200) < .2, rng.integers(5, 11, 200), 0).astype(float)
+        frame['client_id'] = [f'K{i % 7}' for i in range(200)]
+        frame['stock'] = 30.
+        _, daily = prepare(frame)
+        self.assertGreater(daily.quantity_clean.sum(), .95 * frame.quantity.sum())
+        result = order(frame)
+        expected = frame.quantity.tail(60).mean() * result.coverage_days
+        self.assertAlmostEqual(result.demand_for_coverage, expected, delta=.35 * expected)
+
+    def test_slow_mover_stockout_adds_demand(self):
+        frame = sales(60, qty=0.)
+        frame.loc[frame.index % 5 == 0, 'quantity'] = 10.
+        frame.loc[55:, ['quantity', 'stock']] = 0.
+        _, daily = prepare(frame)
+        self.assertGreater(daily.estimated_lost_demand.sum(), 0)
 
     def stockout_frame(self):
         frame = sales()
@@ -196,6 +245,20 @@ class MustHave4OneOffOrders(unittest.TestCase):
 
 
 class MustHave5SupplierListWithReasons(unittest.TestCase):
+
+    def test_manual_approval_validates_minimum_and_multiple(self):
+        base = pd.DataFrame({'sku': ['A1'], 'approved_qty': [25.],
+                             'min_order_qty': [20.], 'order_multiple': [5.]})
+        self.assertEqual(validate_approved_orders(base).approved_qty.iloc[0], 25.)
+        with self.assertRaisesRegex(ValueError, 'кратно'):
+            validate_approved_orders(base.assign(approved_qty=23.))
+        with self.assertRaisesRegex(ValueError, 'минимальной партии'):
+            validate_approved_orders(base.assign(approved_qty=10.))
+        with self.assertRaisesRegex(ValueError, 'неотрицательным'):
+            validate_approved_orders(base.assign(approved_qty=-5.))
+        blocked = base.assign(status='заблокирован — нет актуального остатка')
+        with self.assertRaisesRegex(ValueError, 'без актуального остатка'):
+            validate_approved_orders(blocked)
 
     def test_pipeline_outputs_grouped_orders_with_reason(self):
         parts = []

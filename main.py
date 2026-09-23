@@ -5,7 +5,7 @@ from src.config import Config
 from src.pipeline import run_pipeline
 
 
-DEMO = Path('data/raw')
+DEMO = Path('data/demo')
 
 
 def use_demo_data(args: argparse.Namespace) -> None:
@@ -23,7 +23,7 @@ def use_demo_data(args: argparse.Namespace) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description='Рекомендованные заказы поставщикам на основе прогноза спроса')
-    parser.add_argument('--input', type=Path, help='история продаж (CSV/XLSX); без него — демо-данные из data/raw')
+    parser.add_argument('--input', type=Path, help='история продаж (CSV/XLSX); без него — демо-данные из data/demo')
     parser.add_argument('--suppliers', type=Path, help='справочник поставщиков: supplier, lead_time_days[, min_order_qty]')
     parser.add_argument('--catalog', type=Path, help='номенклатура: sku[, product_name, category, supplier, min_order_qty, order_multiple]')
     parser.add_argument('--stock', type=Path, help='текущие остатки: sku, stock[, in_transit, warehouse]')

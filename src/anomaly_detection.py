@@ -15,7 +15,9 @@ def detect_client_orders(frame: pd.DataFrame) -> pd.DataFrame:
     result['large_client_order_count'] = 0
     if 'client_id' not in result:
         return result
-    orders = result[result.client_id.notna() & result.client_id.ne('')].groupby(['sku', 'date', 'client_id']).quantity.sum().reset_index()
+    # Нулевые строки (снимки остатков) — не заказы: иначе медиана заказа 0 и любая продажа кажется разовой.
+    purchases = result.client_id.notna() & result.client_id.ne('') & result.quantity.gt(0)
+    orders = result[purchases].groupby(['sku', 'date', 'client_id']).quantity.sum().reset_index()
     caps = {}
     for sku, group in orders.groupby('sku', sort=False):
         history = []
@@ -43,9 +45,10 @@ def detect_client_orders(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def detect_daily_outliers(daily: pd.DataFrame) -> pd.DataFrame:
-    # Дневной спрос ограничивается Q3 + 1.5·IQR за предыдущие 90 дней без дефицита.
+    # Дневной спрос ограничивается Q3 + 1.5·IQR за предыдущие 90 дней без дефицита. Считаются только
+    # дни с продажами: у редко продаваемого товара Q3 по всем дням равен 0, и выбросом стал бы любой день.
     result = daily.copy()
-    eligible = result.quantity_clean.where(~result.stockout_flag)
+    eligible = result.quantity_clean.where(~result.stockout_flag & result.quantity_clean.gt(0))
     bounds = eligible.groupby(result.sku).transform(historical_bounds)
     result['outlier_upper_bound'] = bounds
     result['is_outlier'] = result.quantity_clean.gt(bounds)

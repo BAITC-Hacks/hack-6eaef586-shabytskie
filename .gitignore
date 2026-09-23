@@ -2,8 +2,12 @@
 __pycache__/
 *.pyc
 .DS_Store
-.streamlit/secrets.toml
-.pytest_cache/
-outputs/
-data/processed/
 models/
+.pytest_cache/
+.streamlit/secrets.toml
+data/raw/*
+data/processed/*
+outputs/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!outputs/.gitkeep
