@@ -39,22 +39,45 @@ python -m unittest discover -s tests -v
 
 On Windows, create an environment using `py -3.12 -m venv .venv` and activate it using the command `.venv\Scripts\Activate.ps1` in PowerShell. If Python of the required version is not installed, first install Python 3.12; activation does not create the environment.
 
-**Real files in the web interface require login.** Configure OIDC according to [SECURITY.md](SECURITY.md), fill in the server `.streamlit/secrets.toml` according to the example, and set `APP_MODE=production`. An unconfigured production mode blocks access. For local calculation of your files, the trusted operator remains the CLI `python main.py --input ...`.
+**Choose the dashboard mode:** `APP_MODE=demo` provides synthetic examples only; `APP_MODE=local` enables file uploads and order approval without login on the operator's own computer; `APP_MODE=production` requires corporate login. For production, configure OIDC according to [SECURITY.md](SECURITY.md), fill in `.streamlit/secrets.toml` according to the example, and set `APP_MODE=production`. An unconfigured production mode blocks access. The CLI `python main.py --input ...` is also available for local calculations.
 
 After updating the dependencies and modules, stop the old server (`Ctrl+C`) and launch it again: a single tab refresh may not be enough. If `localhost` is not responding, check `http://127.0.0.1:8501` and make sure the old process has released the port.
 
 Inventory policy parameters: `--review-days` (review period, default is 7), `--service-z` (service level z, 1.65 ≈ 95%), `--default-lead-time` (lead time if not specified, 14). `--forecast-days` sets the forecast report horizon. The forecast horizon for an order is selected automatically and covers the longest lead time plus the review period.
 
+### Local dashboard: upload files without login
+
+After installing the dependencies above, stop any previous server with `Ctrl+C` and run from the repository folder. Virtual environment activation is optional when using the explicit Python paths below.
+
+**Windows / VS Code PowerShell:**
+
+```powershell
+$env:APP_MODE = "local"
+.\.venv\Scripts\python.exe -m streamlit run app.py --server.address 127.0.0.1 --server.port 8502
+```
+
+**macOS / Linux:**
+
+```bash
+APP_MODE=local ./.venv/bin/python -m streamlit run app.py --server.address 127.0.0.1 --server.port 8502
+```
+
+Open [http://127.0.0.1:8502](http://127.0.0.1:8502) and select **«Загрузить свои файлы»** in the left sidebar. CSV and XLSX uploads, calculations, approval, and exports are available. Local approvals are attributed to `local-operator`.
+
+Local mode requires a loopback listener (`127.0.0.1` or `::1`) and is intended for the operator's own computer, not public deployment through a proxy or tunnel. To return to demo mode in the same PowerShell terminal, stop the server, set `$env:APP_MODE = "demo"`, and run the launch command again. On macOS/Linux, replace `APP_MODE=local` with `APP_MODE=demo`.
+
 ## Dashboard
 
-`python -m streamlit run app.py` opens the interface in a browser (http://localhost:8501). By default, only demo data is available; the options for uploading real files are available to authorized analysts and managers:
+`python -m streamlit run app.py` opens the interface in a browser (http://localhost:8501). When `APP_MODE` is unset, only demo data is available. File uploads are available in local mode as described above, or to authorized analysts and managers in production:
 
 1. **Data.** Upload sales history (CSV/XLSX, for example, an export from 1C) and, if available, reference data: suppliers, items, stock levels, periods of product unavailability, growth forecast. In the “File Templates” section, you can download examples in the required format. The “Show on demo data” button runs the calculation on synthetic data without its own files.
 2. **Parameters.**Warehouse or category, revision period, service level. Then click the “Run calculation” button.
 3. **Orders by supplier.** Summary indicators, positions of the selected supplier with urgency and justification. The “Approved quantity” column can be edited.
-4. **Statement.**The manager clicks “Approve”: buttons to download the order in XLSX and CSV for 1C appear. The responsible person is determined by the account; the option to enter the full name arbitrarily has been removed. In the demo, the approval is marked as training. The order is not automatically sent to the supplier.
+4. **Statement.**The manager clicks “Approve”: buttons to download the order in XLSX and CSV for 1C appear. In production, the responsible person is determined by the account; in local mode it is `local-operator`. In the demo, the approval is marked as training. The order is not automatically sent to the supplier.
 5. **Article card.** A 120‑day chart: actual sales, demand for calculation (excluding one‑off orders, with missed demand), and forecast for the coverage period. One‑off orders are marked with dots, and days when the item is out of stock are highlighted with a fill. Next, a step‑by‑step calculation of the quantity from forecast to order and a list of events.
 6. **Trends by category.** Weekly adjusted demand.
+
+**Appearance:** open the **⋮** menu at the top right to switch between light and dark themes. The menu is enabled with `client.toolbarMode = "viewer"` in `.streamlit/config.toml`.
 
 The service verifies the owner and session when reading the result. Temporary folders are deleted after an hour, and copied source files are deleted after the calculation. One calculation is allowed at a time, and up to three per user within five minutes; in the public demo, this limit is shared. Browser/Streamlit memory storage limitations and download links are described in [SECURITY.md](SECURITY.md).
 
@@ -62,7 +85,7 @@ The service verifies the owner and session when reading the result. Temporary fo
 
 For public demonstration, use `APP_MODE=demo`, Python 3.12, and only synthetic files from `data/demo/`. The platform must install `requirements.txt` along with `requirements.lock`. Set the listening address to match the network model of the chosen hosting; by default, the repository listens only to loopback.
 
-For real data, HTTPS, OIDC, an authentication gateway before all Streamlit routes, and resource limits are required. The [deploy/nginx.conf.example](deploy/nginx.conf.example) template requires configuration of the domain, certificate, and gateway; it is not an already completed deployment. Configuration order and remaining restrictions: [SECURITY.md](SECURITY.md). Audit results: [SECURITY_REPORT.md](SECURITY_REPORT.md).
+For production deployment with real data, HTTPS, OIDC, an authentication gateway before all Streamlit routes, and resource limits are required. The [deploy/nginx.conf.example](deploy/nginx.conf.example) template requires configuration of the domain, certificate, and gateway; it is not an already completed deployment. Configuration order and remaining restrictions: [SECURITY.md](SECURITY.md). Audit results: [SECURITY_REPORT.md](SECURITY_REPORT.md).
 
 ## Input data
 
