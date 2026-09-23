@@ -14,3 +14,10 @@ def test_missing_and_negative_are_reported():
     b=valid(); b.sales=b.sales.drop(columns="quantity"); assert any("quantity" in e for e in validate_bundle(b))
     b=valid(); b.sales.loc[0,"quantity"]=-2; assert any("negative" in e for e in validate_bundle(b))
 
+
+def test_personal_customer_columns_are_rejected_but_anonymous_id_is_allowed():
+    b=valid(); b.sales["client_id"]=["CLIENT-001"]
+    assert validate_bundle(b)==[]
+    b.sales["customer_name"]=["Personal Name"]
+    assert any("personal customer columns" in e for e in validate_bundle(b))
+
