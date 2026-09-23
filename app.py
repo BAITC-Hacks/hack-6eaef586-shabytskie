@@ -78,6 +78,8 @@ with st.expander("Проверка данных и предпросмотр",exp
     if problems:
         for problem in problems: st.error(problem)
     else: st.success("Схемы и связи таблиц корректны. Загрузчик сохраняет строки; очистка спроса принадлежит forecasting provider.")
+    if "client_id" not in bundle.sales:
+        st.warning("В продажах нет anonymized client_id. Дневные выбросы будут обрабатываться, но проверка разового крупного заказа одного клиента недоступна.")
     for name,df in [("Продажи",bundle.sales),("Остатки",bundle.inventory),("Поставщики",bundle.suppliers),("История наличия",bundle.stock_history)]:
         if df is not None: st.markdown(f"**{name}** · {len(df):,} строк"); st.dataframe(df.head(8),use_container_width=True,hide_index=True)
 current_fp=fingerprint(bundle,settings,mode,origin)
