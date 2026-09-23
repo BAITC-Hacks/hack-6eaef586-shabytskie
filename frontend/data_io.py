@@ -4,7 +4,7 @@ import pandas as pd
 from contracts import InputBundle
 
 TEMPLATES = {
-"sales": pd.DataFrame(columns=["date", "sku", "quantity"]),
+"sales": pd.DataFrame(columns=["date", "sku", "quantity", "client_id", "price", "warehouse"]),
 "inventory": pd.DataFrame(columns=["sku", "product_name", "category", "supplier", "current_stock", "in_transit", "growth_rate", "unit", "unit_cost", "currency", "moq", "order_multiple"]),
 "suppliers": pd.DataFrame(columns=["supplier", "lead_time_days"]),
 "stock_history": pd.DataFrame(columns=["date", "sku", "in_stock"])}
